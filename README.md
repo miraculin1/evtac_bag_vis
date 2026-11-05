@@ -22,6 +22,48 @@
 - FZ 曲线：完整曲线为暗灰色，已播放部分为绿色；黄色竖线为当前时刻，旁边标注当前 `fz` 数值。由于力已取反，`fz` 曲线位于负半轴。
 - 每个 bag 单独导出一个 mp4。
 
+> `session06` 的事件流中还包含一个约 **15 Hz 的全局闪烁**。主视频使用 200 ms 的事件密度窗口，会把闪烁平均掉；为此额外提供了下面的专用可视化。
+
+## session06 闪烁机制专用可视化
+
+`flicker_vis.py` 单独分析 `session06` 事件流中的周期性闪烁：
+
+- 以 0.1 ms 分辨率统计全局事件数，检测到约 850 次 burst。
+- 周期 **66.70 ms（14.99 Hz）**，每次 burst 是一个持续约 1–2 ms 的全局闪光，随后快速衰减。
+- 以 128 个相位对事件进行平均，得到闪烁周期内的相位平均事件图像。
+- FFT 显示 15 Hz 基频以及 30 / 45 / 60 Hz ... 谐波。
+
+输出：
+
+```text
+output/session06_slow_press_flicker_analysis.png   静态诊断图
+output/session06_slow_press_flicker.mp4            闪烁分析视频
+```
+
+运行：
+
+```bash
+/usr/bin/python3 flicker_vis.py
+```
+
+常用参数：
+
+```bash
+# 只生成静态诊断图
+/usr/bin/python3 flicker_vis.py --no-video
+
+# 指定视频时间段
+/usr/bin/python3 flicker_vis.py --start 20 --duration 20
+```
+
+视频内容：
+
+- 左侧：相位平均事件图，慢速循环展示一个 66.7 ms 闪烁周期；下方 filmstrip 显示 8 个代表相位。
+- 右上：全局事件率示波器（1 ms 分箱），可以看到每 66.7 ms 一个尖峰。
+- 右中：burst 触发的平均波形（0.1 ms 分箱）。
+- 右下：事件率 FFT，突出 15 Hz 基频及谐波。
+
+
 ## 环境
 
 脚本依赖 ROS Noetic 的 `rosbag`，以及 `numpy`、`opencv-python`、`ffmpeg`。
