@@ -404,7 +404,10 @@ class Renderer:
             self.fz_min = 0.0
         else:
             self.fz_min = math.floor((fz_min * 1.05) / self.fz_step) * self.fz_step
-        self.fz_max = math.ceil((fz_max * 1.05) / self.fz_step) * self.fz_step
+        if fz_max < 0.05 * fz_span:
+            self.fz_max = 0.0
+        else:
+            self.fz_max = math.ceil((fz_max * 1.05) / self.fz_step) * self.fz_step
         if self.fz_max <= self.fz_min:
             self.fz_max = self.fz_min + self.fz_step
 
@@ -424,10 +427,15 @@ class Renderer:
     # ------------------------------------------------------------------
 
     def _plane_xy(self, fx, fy):
+        # Displayed force is already inverted for the contact convention.
+        # The sensor image is rotated 90 deg clockwise, so the event image's
+        # native +x points down and native +y points left:
+        #   screen +X = -fy   (fy negative points right)
+        #   screen +Y = -fx   (fx positive points down)
         fx = np.asarray(fx, dtype=np.float64)
         fy = np.asarray(fy, dtype=np.float64)
-        px = self.plane_cx + fx * self.plane_scale
-        py = self.plane_cy - fy * self.plane_scale
+        px = self.plane_cx - fy * self.plane_scale
+        py = self.plane_cy + fx * self.plane_scale
         return px.astype(np.int32), py.astype(np.int32)
 
     def _fz_xy(self, t, v):
@@ -467,7 +475,7 @@ class Renderer:
         x0, y0, x1, y1 = self.px0, self.py0, self.px1, self.py1
         cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_PANEL, -1)
         cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_GRID, 1)
-        text(canvas, "FX-FY FORCE VECTOR (N)", (x0, y0 - 14), 0.55, COL_TEXT, 1)
+        text(canvas, "FX-FY FORCE PLANE (N)  |  FX+ down, FY- right", (x0, y0 - 14), 0.55, COL_TEXT, 1)
 
         lim = self.plane_limit
         step = self.plane_step
@@ -478,8 +486,8 @@ class Renderer:
         while k * step <= lim + 1e-9:
             v = k * step
             if abs(v) > 1e-9:
-                px = int(round(cx + v * sc))
-                py = int(round(cy - v * sc))
+                px = int(round(cx - v * sc))
+                py = int(round(cy + v * sc))
                 if x0 < px < x1:
                     cv2.line(canvas, (px, y0 + 1), (px, y1 - 1), COL_GRID, 1)
                 if y0 < py < y1:
@@ -518,7 +526,7 @@ class Renderer:
                 cv2.polylines(canvas, [pts2], False, COL_CYAN, 2, cv2.LINE_AA)
 
         # current vector
-        tip = (int(round(cx + fx * sc)), int(round(cy - fy * sc)))
+        tip = (int(round(cx - fy * sc)), int(round(cy + fx * sc)))
         cv2.arrowedLine(
             canvas, (cx, cy), tip, COL_YELLOW, 3, cv2.LINE_AA, tipLength=0.12
         )
@@ -688,8 +696,13 @@ def process_bag(bag_path, args):
         duration = max(t1 - t0, 1e-6)
 
         f_t, f_fx, f_fy, f_fz = read_force(bag, force_topic, force_type)
+        # The sensor is mounted on the contact side and reports the reaction
+        # force. Flip the sign so the plots show the force applied at contact.
+        f_fx = -f_fx
+        f_fy = -f_fy
+        f_fz = -f_fz
         log(
-            "  force  : "
+            "  force  : (sign inverted) "
             f"{len(f_t)} samples, fx/fy=[{f_fx.min():.2f}, {f_fx.max():.2f}]/"
             f"[{f_fy.min():.2f}, {f_fy.max():.2f}], fz=[{f_fz.min():.2f}, {f_fz.max():.2f}]"
         )
