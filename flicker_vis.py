@@ -55,6 +55,7 @@ COL_AXIS = (95, 88, 82)
 COL_TEXT = (236, 236, 236)
 COL_MUTED = (150, 148, 144)
 COL_FLASH = (80, 100, 255)
+COL_GREEN = (118, 220, 130)
 COL_YELLOW = (80, 212, 255)
 COL_CYAN = (238, 214, 90)
 
@@ -200,6 +201,47 @@ def estimate_period(peaks):
     return float(np.median(d))
 
 
+def compute_recovery(cnt1, peaks, period):
+    """Measure the post-burst recovery time to the P95 quiet baseline.
+
+    Recovery is the first 1 ms bin after the burst where two consecutive
+    bins fall below the 95th percentile of the quiet-period event rate.
+    """
+    peak_bins = np.array([int(round(p / BIN1)) for p in peaks], dtype=np.int64)
+
+    quiet_mask = np.ones(len(cnt1), dtype=bool)
+    for p in peak_bins:
+        quiet_mask[max(0, p) : min(len(cnt1), p + 25)] = False
+    quiet = cnt1[quiet_mask]
+    baseline = float(np.median(quiet))
+    threshold = float(np.percentile(quiet, 95))
+
+    max_len = max(1, int(round(period / BIN1)))
+    recs = []
+    for p in peak_bins:
+        seg = cnt1[p + 1 : p + 1 + max_len]
+        if len(seg) < 3:
+            continue
+        found = None
+        for t in range(len(seg) - 1):
+            if seg[t] <= threshold and seg[t + 1] <= threshold:
+                found = float(t + 1)
+                break
+        if found is not None:
+            recs.append(found)
+    recs = np.asarray(recs, dtype=np.float64)
+    recs = recs[np.isfinite(recs)]
+    if len(recs) == 0:
+        return baseline, threshold, recs, 0.0, 0.0
+    return (
+        baseline,
+        threshold,
+        recs,
+        float(np.median(recs)),
+        float(np.percentile(recs, 90)),
+    )
+
+
 def triggered_average(cnt01, peaks, period):
     nph = int(round(period / BIN01))
     acc = np.zeros(nph, dtype=np.float64)
@@ -289,6 +331,7 @@ def make_static_figure(
     positive,
     threshold,
     start_s,
+    recovery,
 ):
     plt.rcParams.update(
         {
@@ -307,25 +350,42 @@ def make_static_figure(
 
     fig = plt.figure(figsize=(19.2, 10.8), dpi=100)
     gs = fig.add_gridspec(
-        3, 6, height_ratios=[2.0, 2.0, 4.7], hspace=0.48, wspace=0.55
+        3, 12, height_ratios=[2.0, 2.0, 4.7], hspace=0.48, wspace=0.85
     )
+    rec_baseline, rec_threshold, recs, rec_median, rec_p90 = recovery
 
     # ---- 1 ms rate trace -------------------------------------------------
-    ax = fig.add_subplot(gs[0, 0:4])
+    ax = fig.add_subplot(gs[0, 0:8])
     i0 = max(0, int(start_s / BIN1))
     i1 = min(len(cnt1), i0 + 1000)
     seg = cnt1[i0:i1]
     tt = np.arange(i0, i1) * BIN1
-    ax.plot(tt, seg, lw=0.8, color="#ff6b4a")
+    for p in peaks:
+        if tt[0] <= p <= tt[-1]:
+            ax.axvspan(
+                p,
+                p + rec_median / 1000.0,
+                color="#3f6f8f",
+                alpha=0.16,
+                lw=0,
+            )
+    ax.plot(tt, np.maximum(seg, 1), lw=0.8, color="#ff6b4a")
+    ax.axhline(rec_baseline, color="#7aa6b8", lw=0.7, ls="--", alpha=0.8)
+    ax.axhline(rec_threshold, color="#ffd76a", lw=0.8, ls="--", alpha=0.9)
     ax.set_xlim(tt[0], tt[-1])
-    ax.set_ylim(0, max(cnt1.max() * 1.05, 1))
-    ax.set_title("global event rate, 1 ms bins  (15 bursts/s)", loc="left")
+    ax.set_yscale("log")
+    ax.set_ylim(1, max(cnt1.max() * 1.5, 100))
+    ax.set_title(
+        "global event rate, 1 ms bins (log scale; shaded = recovery)", loc="left"
+    )
     ax.set_ylabel("events / ms")
     ax.grid(True, alpha=0.35)
     ax.text(
         0.99,
         0.93,
-        f"peak {cnt1.max()/1e3:.0f}k ev/ms\nbaseline {np.median(cnt1):.0f} ev/ms",
+        f"peak {cnt1.max()/1e3:.0f}k ev/ms\n"
+        f"baseline {rec_baseline:.0f} / threshold {rec_threshold:.0f} ev/ms\n"
+        f"median recovery {rec_median:.0f} ms",
         transform=ax.transAxes,
         ha="right",
         va="top",
@@ -335,7 +395,7 @@ def make_static_figure(
     )
 
     # ---- FFT -------------------------------------------------------------
-    ax = fig.add_subplot(gs[0, 4:6])
+    ax = fig.add_subplot(gs[0, 8:12])
     if fft is not None:
         f, sp = fft
         norm = sp / max(sp.max(), 1e-9)
@@ -362,11 +422,16 @@ def make_static_figure(
     ax.grid(True, alpha=0.35)
 
     # ---- triggered average ----------------------------------------------
-    ax = fig.add_subplot(gs[1, 0:4])
+    ax = fig.add_subplot(gs[1, 0:6])
     ph_ms = np.arange(len(avg)) * BIN01 * 1000.0
+    ax.axvspan(0, rec_median, color="#7ee787", alpha=0.08, lw=0)
     ax.plot(ph_ms, avg, lw=1.0, color="#ff6b4a")
     ax.fill_between(ph_ms, 0, avg, color="#ff6b4a", alpha=0.18)
     ax.axvline(0, color="#ffd76a", lw=0.7, alpha=0.7)
+    ax.axhline(
+        rec_threshold / 10.0, color="#ffd76a", lw=0.8, ls="--", alpha=0.9
+    )
+    ax.axvline(rec_median, color="#7ee787", lw=1.4)
     ax.set_xlim(0, period * 1000)
     ax.set_ylim(0, avg.max() * 1.12)
     ax.set_title("burst-triggered average (0.1 ms bins)", loc="left")
@@ -376,7 +441,8 @@ def make_static_figure(
     ax.text(
         0.99,
         0.93,
-        f"period {period*1000:.2f} ms   |   {1/period:.2f} Hz",
+        f"period {period*1000:.2f} ms   |   {1/period:.2f} Hz\n"
+        f"threshold {rec_threshold:.0f} ev/ms   |   recovery {rec_median:.0f} ms (median)",
         transform=ax.transAxes,
         ha="right",
         va="top",
@@ -385,7 +451,7 @@ def make_static_figure(
     )
 
     # ---- burst onset zoom ------------------------------------------------
-    ax = fig.add_subplot(gs[1, 4:6])
+    ax = fig.add_subplot(gs[1, 6:9])
     z = avg[: int(0.010 / BIN01)]
     tz = np.arange(len(z)) * BIN01 * 1000.0
     ax.plot(tz, z, lw=1.2, color="#ff6b4a")
@@ -395,6 +461,30 @@ def make_static_figure(
     ax.set_title("burst onset, 0-10 ms", loc="left")
     ax.set_xlabel("time after burst peak (ms)")
     ax.set_ylabel("events / 0.1 ms")
+    ax.grid(True, alpha=0.35)
+
+    # ---- recovery time histogram ----------------------------------------
+    ax = fig.add_subplot(gs[1, 9:12])
+    if len(recs):
+        hi = max(40.0, rec_p90 + 5.0)
+        bins = np.arange(0, hi + 2.0, 2.0)
+        ax.hist(recs, bins=bins, color="#ff6b4a", alpha=0.75, edgecolor="#12100f")
+        ax.axvline(rec_median, color="#7ee787", lw=1.4)
+        ax.axvline(rec_p90, color="#ffd76a", lw=1.0, ls="--")
+        ax.text(
+            0.97,
+            0.95,
+            f"median {rec_median:.0f} ms\nP90 {rec_p90:.0f} ms",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            color="#ffd76a",
+            fontsize=9,
+        )
+        ax.set_xlim(0, hi)
+    ax.set_title("recovery time distribution", loc="left")
+    ax.set_xlabel("time to normal rate (ms)")
+    ax.set_ylabel("bursts")
     ax.grid(True, alpha=0.35)
 
     # ---- stats -----------------------------------------------------------
@@ -435,7 +525,8 @@ def make_static_figure(
         f"period {period*1000:.2f} ms ({1/period:.2f} Hz)  |  "
         f"peak 1 ms bin {cnt1.max()/1e3:.0f}k events  |  "
         f"peak 0.1 ms bin {cnt01.max()/1e3:.0f}k events  |  "
-        f"baseline {np.median(cnt1):.0f} events/ms  |  "
+        f"baseline {rec_baseline:.0f} events/ms  |  "
+        f"recovery median {rec_median:.0f} ms / P90 {rec_p90:.0f} ms  |  "
         f"positive {100*positive/max(total_events,1):.1f}%",
         fontsize=9,
         color="#8f8880",
@@ -487,11 +578,18 @@ def make_ffmpeg(out_path, fps, crf, w=1920, h=1080):
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
 
-def draw_rate_panel(canvas, cnt1, t_now, rect, rate_max):
+def draw_rate_panel(canvas, cnt1, peaks, recovery, t_now, rect, rate_max):
     x0, y0, x1, y1 = rect
     cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_PANEL, -1)
     cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_GRID, 1)
-    text(canvas, "GLOBAL EVENT RATE  (1 ms bins)", (x0, y0 - 14), 0.55, COL_TEXT, 1)
+    text(
+        canvas,
+        "GLOBAL EVENT RATE (1 ms, log)  |  yellow = normal threshold, shaded = recovery",
+        (x0, y0 - 14),
+        0.50,
+        COL_TEXT,
+        1,
+    )
 
     i1 = int(t_now / BIN1)
     i0 = max(0, i1 - 1000)
@@ -499,30 +597,47 @@ def draw_rate_panel(canvas, cnt1, t_now, rect, rate_max):
     if len(seg) < 2:
         return
 
+    rec_baseline, rec_threshold, recs, rec_median, rec_p90 = recovery
     plot_x0 = x0 + 70
     plot_y0 = y0 + 20
     plot_x1 = x1 - 16
     plot_y1 = y1 - 36
     xmax = max(t_now, 1e-6)
     xmin = max(0.0, t_now - 1.0)
+    log_den = math.log1p(rate_max)
 
     def sx(t):
         return int(plot_x0 + (t - xmin) / max(xmax - xmin, 1e-9) * (plot_x1 - plot_x0))
 
     def sy(v):
-        return int(plot_y1 - v / rate_max * (plot_y1 - plot_y0))
+        return int(plot_y1 - math.log1p(max(v, 0.0)) / log_den * (plot_y1 - plot_y0))
 
-    # grid + ticks
-    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
-        v = rate_max * frac
+    # recovery bands
+    for p in peaks:
+        if p < xmin or p > xmax:
+            continue
+        xa = sx(max(p, xmin))
+        xb = sx(min(p + rec_median / 1000.0, xmax))
+        cv2.rectangle(canvas, (xa, plot_y0), (xb, plot_y1), (40, 58, 72), -1)
+
+    # grid + y ticks (log decades)
+    for v in (1, 10, 100, 1000, 10000, 100000):
+        if v > rate_max:
+            continue
         yy = sy(v)
         cv2.line(canvas, (plot_x0, yy), (plot_x1, yy), COL_GRID, 1)
-        text_right(canvas, f"{v/1e3:.0f}k", plot_x0 - 8, yy + 5, 0.42, COL_MUTED, 1)
+        label = f"{v/1000:.0f}k" if v >= 1000 else str(v)
+        text_right(canvas, label, plot_x0 - 8, yy + 5, 0.42, COL_MUTED, 1)
     for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
         tt = xmin + (xmax - xmin) * frac
         xx = sx(tt)
         cv2.line(canvas, (xx, plot_y0), (xx, plot_y1), COL_GRID, 1)
         text(canvas, f"{tt:.2f}", (xx - 14, plot_y1 + 22), 0.42, COL_MUTED, 1)
+
+    # baseline / recovery threshold
+    for v, col in ((rec_baseline, (120, 150, 170)), (rec_threshold, COL_YELLOW)):
+        yy = sy(v)
+        cv2.line(canvas, (plot_x0, yy), (plot_x1, yy), col, 1, cv2.LINE_AA)
 
     pts = []
     for j, v in enumerate(seg):
@@ -533,12 +648,13 @@ def draw_rate_panel(canvas, cnt1, t_now, rect, rate_max):
     cv2.line(canvas, (plot_x1, plot_y0), (plot_x1, plot_y1), COL_YELLOW, 1)
 
 
-def draw_average_panel(canvas, avg, period, phase_ms, rect):
+def draw_average_panel(canvas, avg, period, phase_ms, rect, recovery):
     x0, y0, x1, y1 = rect
     cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_PANEL, -1)
     cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_GRID, 1)
     text(canvas, "BURST-TRIGGERED AVERAGE  (0.1 ms bins)", (x0, y0 - 14), 0.55, COL_TEXT, 1)
 
+    rec_baseline, rec_threshold, recs, rec_median, rec_p90 = recovery
     plot_x0 = x0 + 70
     plot_y0 = y0 + 20
     plot_x1 = x1 - 16
@@ -562,11 +678,31 @@ def draw_average_panel(canvas, avg, period, phase_ms, rect):
         cv2.line(canvas, (xx, plot_y0), (xx, plot_y1), COL_GRID, 1)
         text(canvas, f"{ms:.1f}", (xx - 12, plot_y1 + 20), 0.42, COL_MUTED, 1)
 
+    # shaded recovery interval
+    cv2.rectangle(
+        canvas,
+        (sx(0), plot_y0),
+        (sx(rec_median), plot_y1),
+        (44, 66, 48),
+        -1,
+    )
     pts = [
         (sx(i * BIN01 * 1000.0), sy(float(v))) for i, v in enumerate(avg)
     ]
     if len(pts) > 1:
         cv2.polylines(canvas, [np.asarray(pts, np.int32)], False, COL_FLASH, 2, cv2.LINE_AA)
+    thr_y = sy(rec_threshold / 10.0)
+    cv2.line(canvas, (plot_x0, thr_y), (plot_x1, thr_y), COL_YELLOW, 1, cv2.LINE_AA)
+    rec_x = sx(rec_median)
+    cv2.line(canvas, (rec_x, plot_y0), (rec_x, plot_y1), COL_GREEN, 2)
+    text(
+        canvas,
+        f"recovery {rec_median:.0f} ms",
+        (rec_x + 6, plot_y0 + 18),
+        0.42,
+        COL_GREEN,
+        1,
+    )
     cxp = sx(phase_ms)
     cv2.line(canvas, (cxp, plot_y0), (cxp, plot_y1), COL_YELLOW, 2)
 
@@ -575,7 +711,7 @@ def draw_fft_panel(canvas, fft, period, rect):
     x0, y0, x1, y1 = rect
     cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_PANEL, -1)
     cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_GRID, 1)
-    text(canvas, "FFT OF EVENT RATE  |  15 Hz FUNDAMENTAL + HARMONICS", (x0, y0 - 14), 0.55, COL_TEXT, 1)
+    text(canvas, "FFT OF EVENT RATE", (x0, y0 - 14), 0.55, COL_TEXT, 1)
 
     if fft is None:
         return
@@ -615,10 +751,66 @@ def draw_fft_panel(canvas, fft, period, rect):
             cv2.circle(canvas, (xx, yv), 3, COL_YELLOW, -1, cv2.LINE_AA)
 
 
+def draw_recovery_hist_panel(canvas, recovery, rect):
+    x0, y0, x1, y1 = rect
+    cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_PANEL, -1)
+    cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_GRID, 1)
+
+    rec_baseline, rec_threshold, recs, rec_median, rec_p90 = recovery
+    text(
+        canvas,
+        "RECOVERY TIME DISTRIBUTION",
+        (x0, y0 - 14),
+        0.55,
+        COL_TEXT,
+        1,
+    )
+    if len(recs) == 0:
+        return
+
+    hi = max(40.0, rec_p90 + 5.0)
+    bins = np.arange(0.0, hi + 2.0, 2.0)
+    hist, edges = np.histogram(recs, bins=bins)
+    max_count = max(int(hist.max()), 1)
+
+    plot_x0 = x0 + 60
+    plot_y0 = y0 + 18
+    plot_x1 = x1 - 16
+    plot_y1 = y1 - 34
+
+    def sx(ms):
+        return int(plot_x0 + ms / hi * (plot_x1 - plot_x0))
+
+    def sy(cnt):
+        return int(plot_y1 - cnt / max_count * (plot_y1 - plot_y0))
+
+    for frac in (0.0, 0.5, 1.0):
+        yy = sy(max_count * frac)
+        cv2.line(canvas, (plot_x0, yy), (plot_x1, yy), COL_GRID, 1)
+        text_right(canvas, f"{max_count*frac:.0f}", plot_x0 - 8, yy + 5, 0.42, COL_MUTED, 1)
+    for ms in np.arange(0, hi + 0.1, 10):
+        xx = sx(ms)
+        cv2.line(canvas, (xx, plot_y0), (xx, plot_y1), COL_GRID, 1)
+        text(canvas, f"{ms:.0f}", (xx - 8, plot_y1 + 20), 0.42, COL_MUTED, 1)
+
+    for i, h in enumerate(hist):
+        xa = sx(edges[i])
+        xb = sx(edges[i + 1]) - 2
+        cv2.rectangle(canvas, (xa, sy(h)), (xb, plot_y1), (80, 110, 220), -1)
+
+    xm = sx(rec_median)
+    xp = sx(rec_p90)
+    cv2.line(canvas, (xm, plot_y0), (xm, plot_y1), COL_GREEN, 2)
+    cv2.line(canvas, (xp, plot_y0), (xp, plot_y1), COL_YELLOW, 1, cv2.LINE_AA)
+    text_right(canvas, f"median {rec_median:.0f} ms", x1 - 16, y0 + 22, 0.42, COL_GREEN, 1)
+    text_right(canvas, f"P90 {rec_p90:.0f} ms", x1 - 16, y0 + 42, 0.42, COL_YELLOW, 1)
+
+
 def make_video(
     out_path,
     cnt1,
     cnt01,
+    peaks,
     avg,
     period,
     fft,
@@ -628,6 +820,7 @@ def make_video(
     duration_s,
     fps,
     crf,
+    recovery,
 ):
     n_frames = max(1, int(round(duration_s * fps)))
     proc = make_ffmpeg(out_path, fps, crf)
@@ -662,9 +855,10 @@ def make_video(
             text(
                 canvas,
                 f"{1/period:.2f} Hz burst train   |   period {period*1000:.2f} ms   |   "
-                f"peak {cnt01.max()/1e3:.0f}k events / 0.1 ms",
+                f"peak {cnt01.max()/1e3:.0f}k events / 0.1 ms   |   "
+                f"recovery {recovery[3]:.0f} ms (median)",
                 (690, 72),
-                0.50,
+                0.48,
                 COL_MUTED,
                 1,
             )
@@ -728,9 +922,14 @@ def make_video(
             )
 
             # ---- right panels -------------------------------------------
-            draw_rate_panel(canvas, cnt1, t_now, (690, 130, 1896, 500), rate_max)
-            draw_average_panel(canvas, avg, period, phase_ms, (690, 555, 1896, 770))
-            draw_fft_panel(canvas, fft, period, (690, 835, 1896, 1035))
+            draw_rate_panel(
+                canvas, cnt1, peaks, recovery, t_now, (690, 130, 1896, 500), rate_max
+            )
+            draw_average_panel(
+                canvas, avg, period, phase_ms, (690, 555, 1896, 770), recovery
+            )
+            draw_fft_panel(canvas, fft, period, (690, 835, 1290, 1035))
+            draw_recovery_hist_panel(canvas, recovery, (1310, 835, 1896, 1035))
 
             # current burst count
             i1 = int(t_now / BIN1)
@@ -803,9 +1002,16 @@ def main():
         peaks = refine_peaks(peaks, cnt01)
         period = estimate_period(peaks)
         avg, n_cycles = triggered_average(cnt01, peaks, period)
+        recovery = compute_recovery(cnt1, peaks, period)
+        rec_baseline, rec_threshold, recs, rec_median, rec_p90 = recovery
         log(
             f"  flicker: {len(peaks)} bursts, period {period*1000:.2f} ms "
             f"({1/period:.2f} Hz), {n_cycles} cycles averaged"
+        )
+        log(
+            f"  recover: baseline {rec_baseline:.0f}/ms, threshold "
+            f"{rec_threshold:.0f}/ms, median {rec_median:.1f} ms, "
+            f"P90 {rec_p90:.1f} ms ({len(recs)} bursts)"
         )
 
         fft = compute_fft(cnt1, args.start, 10.0)
@@ -840,6 +1046,7 @@ def main():
             positive,
             50000.0,
             args.start,
+            recovery,
         )
 
         if not args.no_video:
@@ -848,6 +1055,7 @@ def main():
                 video_path,
                 cnt1,
                 cnt01,
+                peaks,
                 avg,
                 period,
                 fft,
@@ -857,6 +1065,7 @@ def main():
                 min(args.duration, duration - args.start),
                 args.fps,
                 args.crf,
+                recovery,
             )
 
         log(f"  done   : {time.time()-t0:.1f}s")

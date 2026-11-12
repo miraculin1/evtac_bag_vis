@@ -68,6 +68,12 @@ COL_BLUE = (255, 168, 72)
 COL_GREEN = (118, 220, 130)
 COL_YELLOW = (80, 212, 255)
 COL_CYAN = (238, 214, 90)
+COL_TX = (80, 120, 255)
+COL_TY = (255, 170, 80)
+COL_TZ = (118, 220, 130)
+COL_TX_DIM = (70, 70, 130)
+COL_TY_DIM = (130, 100, 60)
+COL_TZ_DIM = (60, 100, 65)
 
 
 # ---------------------------------------------------------------------------
@@ -168,22 +174,25 @@ def detect_topics(bag):
 
 
 def read_force(bag, topic, msg_type):
-    """Return (t, fx, fy, fz) as float64 arrays, sorted and deduplicated."""
+    """Return (t, fx, fy, fz, tx, ty, tz) as float64 arrays, sorted and deduped."""
     rows = []
     for _, msg, rec in bag.read_messages(topics=[topic]):
         try:
             if msg_type == "geometry_msgs/WrenchStamped":
                 f = msg.wrench.force
+                q = msg.wrench.torque
                 fx, fy, fz = f.x, f.y, f.z
+                tx, ty, tz = q.x, q.y, q.z
             elif msg_type == "force_data_process/Force":
                 fx, fy, fz = msg.fx, msg.fy, msg.fz
+                tx, ty, tz = msg.tx, msg.ty, msg.tz
             else:
                 raise RuntimeError(f"unsupported force message type: {msg_type}")
 
             stamp = msg.header.stamp.to_sec()
             if not np.isfinite(stamp) or stamp <= 0:
                 stamp = rec.to_sec()
-            rows.append((stamp, fx, fy, fz))
+            rows.append((stamp, fx, fy, fz, tx, ty, tz))
         except AttributeError as exc:
             raise RuntimeError(
                 f"cannot read force message of type {msg_type}: {exc}"
@@ -203,7 +212,8 @@ def read_force(bag, topic, msg_type):
 
     if len(arr) < 2:
         raise RuntimeError(f"not enough force samples on {topic}")
-    return arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
+    return (arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3],
+            arr[:, 4], arr[:, 5], arr[:, 6])
 
 
 def parse_event_raw(raw):
@@ -364,13 +374,29 @@ class DensitySurface:
 
 
 class Renderer:
-    def __init__(self, bag_name, duration, f_t, f_fx, f_fy, f_fz, event_h, event_w):
+    def __init__(
+        self,
+        bag_name,
+        duration,
+        f_t,
+        f_fx,
+        f_fy,
+        f_fz,
+        f_tx,
+        f_ty,
+        f_tz,
+        event_h,
+        event_w,
+    ):
         self.bag_name = bag_name
         self.duration = float(duration)
         self.f_t = f_t  # already relative to the rendered time window
         self.f_fx = f_fx
         self.f_fy = f_fy
         self.f_fz = f_fz
+        self.f_tx = f_tx
+        self.f_ty = f_ty
+        self.f_tz = f_tz
         self.event_h = event_h
         self.event_w = event_w
 
@@ -380,18 +406,27 @@ class Renderer:
         self.ex = 24
         self.ey = 56
 
-        # --- 2D force plane geometry ---
-        self.px0, self.py0, self.px1, self.py1 = 852, 76, 1362, 586
-        max_abs = float(np.max(np.abs(np.concatenate([f_fx, f_fy]))))
-        max_abs = max(max_abs, 0.1)
-        step = nice_step(max_abs * 2.16, target=6.0)
-        limit = step * math.ceil((max_abs * 1.08) / step)
-        self.plane_limit = max(limit, step)
-        self.plane_step = step
-        self.plane_cx = (self.px0 + self.px1) // 2
-        self.plane_cy = (self.py0 + self.py1) // 2
-        self.plane_scale = min(self.px1 - self.px0, self.py1 - self.py0) / (
-            2.0 * self.plane_limit
+        # --- semi-transparent force HUD in the middle of the event image ---
+        self.hud_cx = self.ex + self.ew // 2
+        self.hud_cy = self.ey + self.eh // 2
+        self.hud_r = 210
+        max_f = float(np.max(np.abs(np.concatenate([f_fx, f_fy]))))
+        max_f = max(max_f, 0.1)
+        step_f = nice_step(max_f * 2.16, target=6.0)
+        self.force_step = step_f
+        self.force_limit = max(
+            step_f * math.ceil((max_f * 1.08) / step_f), step_f
+        )
+        self.force_scale = self.hud_r / self.force_limit
+
+        # --- torque time-series panel (replaces the old FX-FY plane) ---
+        self.tx0, self.ty0, self.tx1, self.ty1 = 852, 76, 1896, 586
+        max_t = float(np.max(np.abs(np.concatenate([f_tx, f_ty, f_tz]))))
+        max_t = max(max_t, 1e-6)
+        step_t = nice_step(max_t * 2.16, target=6.0)
+        self.torque_step = step_t
+        self.torque_limit = max(
+            step_t * math.ceil((max_t * 1.08) / step_t), step_t
         )
 
         # --- fz plot geometry ---
@@ -411,7 +446,7 @@ class Renderer:
         if self.fz_max <= self.fz_min:
             self.fz_max = self.fz_min + self.fz_step
 
-        # Downsampled polyline for efficient fz rendering.
+        # Downsampled polylines for efficient time-series rendering.
         n = len(self.f_t)
         if n > 4000:
             idx = np.linspace(0, n - 1, 4000).astype(np.int64)
@@ -422,20 +457,24 @@ class Renderer:
         self.fz_ds_v = f_fz[idx]
         self.fz_full_pts = self._fz_points(self.fz_ds_t, self.fz_ds_v)
 
+        self.torque_ds_t = self.f_t[idx]
+        self.torque_pts = {
+            "tx": self._torque_points(self.torque_ds_t, f_tx[idx]),
+            "ty": self._torque_points(self.torque_ds_t, f_ty[idx]),
+            "tz": self._torque_points(self.torque_ds_t, f_tz[idx]),
+        }
+
     # ------------------------------------------------------------------
     # coordinate maps
     # ------------------------------------------------------------------
 
-    def _plane_xy(self, fx, fy):
-        # Displayed force is already inverted for the contact convention.
-        # The sensor image is rotated 90 deg clockwise, so the event image's
-        # native +x points down and native +y points left:
-        #   screen +X = -fy   (fy negative points right)
-        #   screen +Y = -fx   (fx positive points down)
+    def _hud_xy(self, fx, fy):
+        # Same orientation as the rotated event image:
+        #   screen +X = -fy, screen +Y = -fx (fx positive points down)
         fx = np.asarray(fx, dtype=np.float64)
         fy = np.asarray(fy, dtype=np.float64)
-        px = self.plane_cx - fy * self.plane_scale
-        py = self.plane_cy + fx * self.plane_scale
+        px = self.hud_cx - fy * self.force_scale
+        py = self.hud_cy + fx * self.force_scale
         return px.astype(np.int32), py.astype(np.int32)
 
     def _fz_xy(self, t, v):
@@ -449,6 +488,19 @@ class Renderer:
 
     def _fz_points(self, t, v):
         px, py = self._fz_xy(np.asarray(t), np.asarray(v))
+        return np.column_stack([px, py]).astype(np.int32)
+
+    def _torque_xy(self, t, v):
+        t = np.asarray(t, dtype=np.float64)
+        v = np.asarray(v, dtype=np.float64)
+        px = self.tx0 + (t / self.duration) * (self.tx1 - self.tx0)
+        py = (self.ty0 + self.ty1) / 2.0 - (v / self.torque_limit) * (
+            (self.ty1 - self.ty0) / 2.0
+        )
+        return px.astype(np.int32), py.astype(np.int32)
+
+    def _torque_points(self, t, v):
+        px, py = self._torque_xy(np.asarray(t), np.asarray(v))
         return np.column_stack([px, py]).astype(np.int32)
 
     # ------------------------------------------------------------------
@@ -471,91 +523,195 @@ class Renderer:
         put_box(canvas, x + 10, y + 10, tw + 20, th + 14, (0, 0, 0), 0.55)
         text(canvas, label, (x + 20, y + 10 + th + 4), 0.62, COL_TEXT, 1)
 
-    def _draw_plane(self, canvas, t, fx, fy):
-        x0, y0, x1, y1 = self.px0, self.py0, self.px1, self.py1
-        cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_PANEL, -1)
-        cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_GRID, 1)
-        text(canvas, "FX-FY FORCE PLANE (N)  |  FX+ down, FY- right", (x0, y0 - 14), 0.55, COL_TEXT, 1)
+    def _draw_force_hud(self, canvas, t, fx, fy):
+        """Semi-transparent fx-fy vector overlaid on the event image."""
+        ex, ey, ew, eh = self.ex, self.ey, self.ew, self.eh
+        roi = canvas[ey : ey + eh, ex : ex + ew]
+        hud = roi.copy()
 
-        lim = self.plane_limit
-        step = self.plane_step
-        cx, cy, sc = self.plane_cx, self.plane_cy, self.plane_scale
+        cx = self.hud_cx - ex
+        cy = self.hud_cy - ey
+        r = self.hud_r
+        sc = self.force_scale
+        lim = self.force_limit
+        step = self.force_step
 
-        # grid + tick labels
-        k = int(math.floor(-lim / step))
-        while k * step <= lim + 1e-9:
-            v = k * step
+        cv2.circle(hud, (cx, cy), r, COL_GRID, 1, cv2.LINE_AA)
+        cv2.line(hud, (cx - r, cy), (cx + r, cy), COL_AXIS, 1, cv2.LINE_AA)
+        cv2.line(hud, (cx, cy - r), (cx, cy + r), COL_AXIS, 1, cv2.LINE_AA)
+
+        # grid chords clipped to the circle
+        v = -lim
+        while v <= lim + 1e-9:
             if abs(v) > 1e-9:
-                px = int(round(cx - v * sc))
-                py = int(round(cy + v * sc))
-                if x0 < px < x1:
-                    cv2.line(canvas, (px, y0 + 1), (px, y1 - 1), COL_GRID, 1)
-                if y0 < py < y1:
-                    cv2.line(canvas, (x0 + 1, py), (x1 - 1, py), COL_GRID, 1)
+                gx = cx - v * sc
+                dx = gx - cx
+                if abs(dx) < r - 3:
+                    half = math.sqrt(max(r * r - dx * dx, 0.0))
+                    cv2.line(
+                        hud,
+                        (int(round(gx)), int(round(cy - half))),
+                        (int(round(gx)), int(round(cy + half))),
+                        COL_GRID,
+                        1,
+                    )
+                gy = cy + v * sc
+                dy = gy - cy
+                if abs(dy) < r - 3:
+                    half = math.sqrt(max(r * r - dy * dy, 0.0))
+                    cv2.line(
+                        hud,
+                        (int(round(cx - half)), int(round(gy))),
+                        (int(round(cx + half)), int(round(gy))),
+                        COL_GRID,
+                        1,
+                    )
+            v += step
 
-                label = f"{v:g}"
-                if x0 + 20 < px < x1 - 20:
-                    text(canvas, label, (px - 12, y1 - 8), 0.40, COL_MUTED, 1)
-                if y0 + 14 < py < y1 - 8:
-                    text(canvas, label, (x0 + 5, py - 4), 0.40, COL_MUTED, 1)
-            k += 1
-
-        cv2.line(canvas, (x0 + 1, cy), (x1 - 1, cy), COL_AXIS, 1)
-        cv2.line(canvas, (cx, y0 + 1), (cx, y1 - 1), COL_AXIS, 1)
-
-        # recent trail (last 2.5 s)
+        # recent trail
         lo = int(np.searchsorted(self.f_t, max(t - 2.5, 0.0), side="left"))
         hi = int(np.searchsorted(self.f_t, t, side="right"))
         if hi > lo + 1:
-            stride = max(1, (hi - lo) // 500)
-            tt = self.f_t[lo:hi:stride]
-            vx = self.f_fx[lo:hi:stride]
-            vy = self.f_fy[lo:hi:stride]
-            pts = np.column_stack(self._plane_xy(vx, vy)).astype(np.int32)
-            cv2.polylines(canvas, [pts], False, COL_CYAN, 1, cv2.LINE_AA)
+            stride = max(1, (hi - lo) // 400)
+            pts = np.column_stack(
+                self._hud_xy(
+                    self.f_fx[lo:hi:stride], self.f_fy[lo:hi:stride]
+                )
+            ).astype(np.int32)
+            pts[:, 0] -= ex
+            pts[:, 1] -= ey
+            cv2.polylines(hud, [pts], False, COL_CYAN, 1, cv2.LINE_AA)
 
-            # brighter last 0.5 s
             lo2 = int(np.searchsorted(self.f_t, max(t - 0.5, 0.0), side="left"))
             if hi > lo2 + 1:
-                stride2 = max(1, (hi - lo2) // 200)
+                stride2 = max(1, (hi - lo2) // 150)
                 pts2 = np.column_stack(
-                    self._plane_xy(
+                    self._hud_xy(
                         self.f_fx[lo2:hi:stride2], self.f_fy[lo2:hi:stride2]
                     )
                 ).astype(np.int32)
-                cv2.polylines(canvas, [pts2], False, COL_CYAN, 2, cv2.LINE_AA)
+                pts2[:, 0] -= ex
+                pts2[:, 1] -= ey
+                cv2.polylines(hud, [pts2], False, COL_CYAN, 2, cv2.LINE_AA)
 
         # current vector
-        tip = (int(round(cx - fy * sc)), int(round(cy + fx * sc)))
+        tip_x = int(round(cx - fy * sc))
+        tip_y = int(round(cy + fx * sc))
         cv2.arrowedLine(
-            canvas, (cx, cy), tip, COL_YELLOW, 3, cv2.LINE_AA, tipLength=0.12
+            hud,
+            (cx, cy),
+            (tip_x, tip_y),
+            COL_YELLOW,
+            3,
+            cv2.LINE_AA,
+            tipLength=0.12,
         )
-        cv2.circle(canvas, tip, 5, COL_YELLOW, -1, cv2.LINE_AA)
-        cv2.circle(canvas, (cx, cy), 3, COL_TEXT, -1, cv2.LINE_AA)
+        cv2.circle(hud, (tip_x, tip_y), 5, COL_YELLOW, -1, cv2.LINE_AA)
+        cv2.circle(hud, (cx, cy), 3, COL_TEXT, -1, cv2.LINE_AA)
 
-        if hi > 0:
-            cur_label = f"({fx:+.2f}, {fy:+.2f})"
-            (tw, th), _ = cv2.getTextSize(
-                cur_label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1
-            )
-            tx = min(max(tip[0] + 10, x0 + 4), x1 - tw - 10)
-            ty = min(max(tip[1] - 10, y0 + th + 6), y1 - 6)
-            put_box(canvas, tx - 4, ty - th - 4, tw + 8, th + 8, (0, 0, 0), 0.55)
-            text(canvas, cur_label, (tx, ty), 0.52, COL_YELLOW, 1)
+        cv2.addWeighted(hud, 0.62, roi, 0.38, 0, roi)
 
-        # numeric readout
+        # labels stay fully opaque for readability
+        title = "FX-FY  (N)   |   FX+ down, FY- right"
+        (tw, th), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+        tx = ex + (ew - tw) // 2
+        ty = cy - r - 10
+        put_box(canvas, tx - 6, ty - th - 4, tw + 12, th + 10, (0, 0, 0), 0.55)
+        text(canvas, title, (tx, ty), 0.48, COL_TEXT, 1)
+
         mag = float(math.hypot(fx, fy))
-        rx = x1 + 20
-        rows = (
-            ("FX", f"{format_n(fx)} N", COL_RED),
-            ("FY", f"{format_n(fy)} N", COL_BLUE),
-            ("|FXY|", f"{mag:.3f} N", COL_CYAN),
+        label = f"fx {fx:+.2f}   fy {fy:+.2f}   |f| {mag:.2f} N"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        tx = ex + (ew - tw) // 2
+        ty = cy + r + 28
+        put_box(canvas, tx - 6, ty - th - 4, tw + 12, th + 10, (0, 0, 0), 0.55)
+        text(canvas, label, (tx, ty), 0.55, COL_YELLOW, 1)
+
+        text(canvas, "FX+", (cx + 8, cy + r - 8), 0.40, COL_MUTED, 1)
+        text(canvas, "FY-", (cx + r - 42, cy - 8), 0.40, COL_MUTED, 1)
+
+    def _draw_torque(self, canvas, t, tx, ty, tz):
+        x0, y0, x1, y1 = self.tx0, self.ty0, self.tx1, self.ty1
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_PANEL, -1)
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_GRID, 1)
+        text(
+            canvas,
+            "TORQUE / TIME (Nm)  |  sign inverted",
+            (x0, y0 - 14),
+            0.55,
+            COL_TEXT,
+            1,
         )
-        yy = y0 + 52
-        for name, val, col in rows:
-            text(canvas, name, (rx, yy), 0.55, COL_MUTED, 1)
-            text(canvas, val, (rx, yy + 42), 0.95, col, 2)
-            yy += 118
+
+        # y grid / labels
+        v = -self.torque_limit
+        while v <= self.torque_limit + 1e-9:
+            py = int(
+                round(
+                    (y0 + y1) / 2.0
+                    - (v / self.torque_limit) * ((y1 - y0) / 2.0)
+                )
+            )
+            cv2.line(canvas, (x0 + 1, py), (x1 - 1, py), COL_GRID, 1)
+            label = "0" if abs(v) < self.torque_step * 1e-6 else f"{v:g}"
+            text_right(canvas, label, x0 - 10, py + 5, 0.42, COL_MUTED, 1)
+            v += self.torque_step
+
+        # x grid / time labels
+        tstep = nice_step(self.duration, target=10.0)
+        tt = 0.0
+        while tt <= self.duration + 1e-9:
+            px = int(round(x0 + (tt / self.duration) * (x1 - x0)))
+            cv2.line(canvas, (px, y0 + 1), (px, y1 - 1), COL_GRID, 1)
+            text(canvas, f"{tt:g}", (px - 12, y1 + 22), 0.42, COL_MUTED, 1)
+            tt += tstep
+
+        cv2.line(
+            canvas,
+            (x0 + 1, (y0 + y1) // 2),
+            (x1 - 1, (y0 + y1) // 2),
+            COL_AXIS,
+            1,
+        )
+
+        j = int(np.searchsorted(self.torque_ds_t, t, side="right"))
+        series = (
+            ("tx", tx, COL_TX, COL_TX_DIM),
+            ("ty", ty, COL_TY, COL_TY_DIM),
+            ("tz", tz, COL_TZ, COL_TZ_DIM),
+        )
+        for name, val, col, dim in series:
+            pts = self.torque_pts[name]
+            if len(pts) > 1:
+                cv2.polylines(canvas, [pts], False, dim, 1, cv2.LINE_AA)
+            if j > 1:
+                cv2.polylines(canvas, [pts[:j]], False, col, 2, cv2.LINE_AA)
+
+        cxp = int(round(x0 + (t / self.duration) * (x1 - x0)))
+        overlay = canvas.copy()
+        cv2.line(overlay, (cxp, y0 + 1), (cxp, y1 - 1), COL_YELLOW, 2)
+        cv2.addWeighted(overlay, 0.85, canvas, 0.15, 0, canvas)
+        for name, val, col, _dim in series:
+            _, py = self._torque_xy(np.array([t]), np.array([val]))
+            cyp = int(py[0])
+            cv2.circle(canvas, (cxp, cyp), 4, col, -1, cv2.LINE_AA)
+
+        # legend + current values
+        lx = x1 - 320
+        ly = y0 + 14
+        put_box(canvas, lx - 8, ly - 6, 320, 92, (0, 0, 0), 0.62)
+        for i, (name, val, col, _dim) in enumerate(series):
+            yy = ly + 20 + i * 24
+            cv2.line(canvas, (lx, yy - 4), (lx + 22, yy - 4), col, 3, cv2.LINE_AA)
+            text(
+                canvas,
+                f"{name}  {format_n(val)}",
+                (lx + 30, yy),
+                0.50,
+                col,
+                1,
+            )
+        text(canvas, "Nm", (lx + 30, ly + 86), 0.40, COL_MUTED, 1)
 
     def _draw_fz(self, canvas, t, fz):
         x0, y0, x1, y1 = self.gx0, self.gy0, self.gx1, self.gy1
@@ -616,16 +772,25 @@ class Renderer:
 
     # ------------------------------------------------------------------
 
-    def render(self, t, event_img, fx, fy, fz):
+    def render(self, t, event_img, fx, fy, fz, tx, ty, tz):
         canvas = np.empty((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
         canvas[:] = COL_BG
 
         self._draw_event_panel(canvas, event_img, t)
-        self._draw_plane(canvas, t, fx, fy)
+        self._draw_force_hud(canvas, t, fx, fy)
+        self._draw_torque(canvas, t, tx, ty, tz)
         self._draw_fz(canvas, t, fz)
 
         text(canvas, self.bag_name, (848, 40), 0.62, COL_TEXT, 1)
-        text_right(canvas, "EVENT + FORCE VISUALIZATION", CANVAS_W - 24, 40, 0.48, COL_MUTED, 1)
+        text_right(
+            canvas,
+            "EVENT + FORCE + TORQUE VISUALIZATION",
+            CANVAS_W - 24,
+            40,
+            0.48,
+            COL_MUTED,
+            1,
+        )
         return canvas
 
 
@@ -634,11 +799,14 @@ class Renderer:
 # ---------------------------------------------------------------------------
 
 
-def force_at(t, f_t, f_fx, f_fy, f_fz):
+def force_at(t, f_t, f_fx, f_fy, f_fz, f_tx, f_ty, f_tz):
     return (
         float(np.interp(t, f_t, f_fx)),
         float(np.interp(t, f_t, f_fy)),
         float(np.interp(t, f_t, f_fz)),
+        float(np.interp(t, f_t, f_tx)),
+        float(np.interp(t, f_t, f_ty)),
+        float(np.interp(t, f_t, f_tz)),
     )
 
 
@@ -695,16 +863,33 @@ def process_bag(bag_path, args):
             t1 = min(t1, bag.get_start_time() + args.end)
         duration = max(t1 - t0, 1e-6)
 
-        f_t, f_fx, f_fy, f_fz = read_force(bag, force_topic, force_type)
+        (
+            f_t,
+            f_fx,
+            f_fy,
+            f_fz,
+            f_tx,
+            f_ty,
+            f_tz,
+        ) = read_force(bag, force_topic, force_type)
         # The sensor is mounted on the contact side and reports the reaction
-        # force. Flip the sign so the plots show the force applied at contact.
+        # force/torque. Flip the signs so the plots show contact values.
         f_fx = -f_fx
         f_fy = -f_fy
         f_fz = -f_fz
+        f_tx = -f_tx
+        f_ty = -f_ty
+        f_tz = -f_tz
         log(
             "  force  : (sign inverted) "
             f"{len(f_t)} samples, fx/fy=[{f_fx.min():.2f}, {f_fx.max():.2f}]/"
             f"[{f_fy.min():.2f}, {f_fy.max():.2f}], fz=[{f_fz.min():.2f}, {f_fz.max():.2f}]"
+        )
+        log(
+            "  torque : "
+            f"tx/ty=[{f_tx.min():.3f}, {f_tx.max():.3f}]/"
+            f"[{f_ty.min():.3f}, {f_ty.max():.3f}], "
+            f"tz=[{f_tz.min():.3f}, {f_tz.max():.3f}] Nm"
         )
 
         # Restrict force samples to the rendered time window (important for --start/--end).
@@ -715,6 +900,9 @@ def process_bag(bag_path, args):
         f_fx = f_fx[sel]
         f_fy = f_fy[sel]
         f_fz = f_fz[sel]
+        f_tx = f_tx[sel]
+        f_ty = f_ty[sel]
+        f_tz = f_tz[sel]
         f_t_rel = f_t - t0
 
         rate = estimate_event_rate(bag, event_topic, t0, window=min(2.0, duration))
@@ -753,7 +941,19 @@ def process_bag(bag_path, args):
             if mode == "density"
             else EventSurface(event_h, event_w, tau, args.fps)
         )
-        renderer = Renderer(stem, duration, f_t_rel, f_fx, f_fy, f_fz, event_h, event_w)
+        renderer = Renderer(
+            stem,
+            duration,
+            f_t_rel,
+            f_fx,
+            f_fy,
+            f_fz,
+            f_tx,
+            f_ty,
+            f_tz,
+            event_h,
+            event_w,
+        )
 
         if args.preview is not None:
             return render_preview(
@@ -778,8 +978,10 @@ def process_bag(bag_path, args):
             t = min(t0 + (idx + 1) / args.fps, t1)
             t_rel = t - t0
             ev_img = surface.render(t)
-            fx, fy, fz = force_at(t_rel, f_t_rel, f_fx, f_fy, f_fz)
-            canvas = renderer.render(t_rel, ev_img, fx, fy, fz)
+            fx, fy, fz, tx, ty, tz = force_at(
+                t_rel, f_t_rel, f_fx, f_fy, f_fz, f_tx, f_ty, f_tz
+            )
+            canvas = renderer.render(t_rel, ev_img, fx, fy, fz, tx, ty, tz)
             proc.stdin.write(canvas.tobytes())
             frame_idx = idx + 1
             if frame_idx % 150 == 0 or frame_idx == n_frames:
@@ -875,18 +1077,25 @@ def render_preview(bag, event_topic, surface, renderer, args, stem, t0, t1):
             surface.add(ex[mask], ey[mask], et[mask], ep[mask])
 
     ev_img = surface.render(target_abs)
-    fx, fy, fz = force_at(
+    fx, fy, fz, tx, ty, tz = force_at(
         target,
         renderer.f_t,
         renderer.f_fx,
         renderer.f_fy,
         renderer.f_fz,
+        renderer.f_tx,
+        renderer.f_ty,
+        renderer.f_tz,
     )
-    canvas = renderer.render(target, ev_img, fx, fy, fz)
+    canvas = renderer.render(target, ev_img, fx, fy, fz, tx, ty, tz)
     out = os.path.join(args.out_dir, f"preview_{stem}_{target:.1f}s.png")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     cv2.imwrite(out, canvas)
-    log(f"  preview: {out} (fx={fx:+.3f}, fy={fy:+.3f}, fz={fz:+.3f})")
+    log(
+        f"  preview: {out} "
+        f"(fx={fx:+.3f}, fy={fy:+.3f}, fz={fz:+.3f}, "
+        f"tx={tx:+.3f}, ty={ty:+.3f}, tz={tz:+.3f})"
+    )
     return out
 
 
