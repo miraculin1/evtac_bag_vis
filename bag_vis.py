@@ -535,9 +535,11 @@ class Renderer:
         f_tz,
         event_h,
         event_w,
+        force_orientation="new",
     ):
         self.bag_name = bag_name
         self.duration = float(duration)
+        self.force_orientation = force_orientation
         self.f_t = f_t  # already relative to the rendered time window
         self.f_fx = f_fx
         self.f_fy = f_fy
@@ -627,12 +629,17 @@ class Renderer:
     # ------------------------------------------------------------------
 
     def _hud_xy(self, fx, fy):
-        # Same orientation as the rotated event image:
-        #   screen +X = -fy, screen +Y = -fx (fx positive points down)
         fx = np.asarray(fx, dtype=np.float64)
         fy = np.asarray(fy, dtype=np.float64)
-        px = self.hud_cx - fy * self.force_scale
-        py = self.hud_cy + fx * self.force_scale
+        if self.force_orientation == "old":
+            # Old bags: screen +X = -fy, screen +Y = +fx
+            px = self.hud_cx - fy * self.force_scale
+            py = self.hud_cy + fx * self.force_scale
+        else:
+            # New bags: screen +X = -fx, screen +Y = -fy
+            # so fx negative points right and fy negative points down.
+            px = self.hud_cx - fx * self.force_scale
+            py = self.hud_cy - fy * self.force_scale
         return px.astype(np.int32), py.astype(np.int32)
 
     def _fz_xy(self, t, v):
@@ -756,8 +763,12 @@ class Renderer:
                 cv2.polylines(hud, [pts2], False, COL_CYAN, 2, cv2.LINE_AA)
 
         # current vector
-        tip_x = int(round(cx - fy * sc))
-        tip_y = int(round(cy + fx * sc))
+        if self.force_orientation == "old":
+            tip_x = int(round(cx - fy * sc))
+            tip_y = int(round(cy + fx * sc))
+        else:
+            tip_x = int(round(cx - fx * sc))
+            tip_y = int(round(cy - fy * sc))
         cv2.arrowedLine(
             hud,
             (cx, cy),
@@ -773,7 +784,14 @@ class Renderer:
         cv2.addWeighted(hud, 0.62, roi, 0.38, 0, roi)
 
         # labels stay fully opaque for readability
-        title = "FX-FY  (N)   |   FX+ down, FY- right"
+        if self.force_orientation == "old":
+            title = "FX-FY  (N)   |   FX+ down, FY- right"
+            right_label = "FY-"
+            bottom_label = "FX+"
+        else:
+            title = "FX-FY  (N)   |   FX- right, FY- down"
+            right_label = "FX-"
+            bottom_label = "FY-"
         (tw, th), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
         tx = ex + (ew - tw) // 2
         ty = cy - r - 10
@@ -788,8 +806,8 @@ class Renderer:
         put_box(canvas, tx - 6, ty - th - 4, tw + 12, th + 10, (0, 0, 0), 0.55)
         text(canvas, label, (tx, ty), 0.55, COL_YELLOW, 1)
 
-        text(canvas, "FX+", (cx + 8, cy + r - 8), 0.40, COL_MUTED, 1)
-        text(canvas, "FY-", (cx + r - 42, cy - 8), 0.40, COL_MUTED, 1)
+        text(canvas, bottom_label, (cx + 8, cy + r - 8), 0.40, COL_MUTED, 1)
+        text(canvas, right_label, (cx + r - 42, cy - 8), 0.40, COL_MUTED, 1)
 
     def _draw_torque_static(self, canvas):
         x0, y0, x1, y1 = self.tx0, self.ty0, self.tx1, self.ty1
@@ -1147,6 +1165,7 @@ def process_bag(bag_path, args):
             f_tz,
             event_h,
             event_w,
+            force_orientation=getattr(args, "force_orientation", "new"),
         )
 
         if args.preview is not None:
@@ -1427,6 +1446,13 @@ def main():
         choices=("auto", "surface", "density"),
         default="auto",
         help="event rendering: last-event time surface, count density, or auto",
+    )
+    ap.add_argument(
+        "--force-orientation",
+        choices=("new", "old"),
+        default="new",
+        help="force HUD axes: new = fx- right / fy- down (default), "
+        "old = fx+ down / fy- right",
     )
     ap.add_argument(
         "--preview",
