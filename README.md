@@ -87,6 +87,13 @@ output/session06_slow_press_flicker.mp4            闪烁分析视频
 /usr/bin/python3 bag_vis.py
 ```
 
+直接指定 folder 路径（位置参数或 `--folder` 均可）：
+
+```bash
+/usr/bin/python3 bag_vis.py /path/to/bags --out-dir output
+/usr/bin/python3 bag_vis.py --folder /path/to/bags --out-dir output
+```
+
 指定输出目录：
 
 ```bash
@@ -96,7 +103,21 @@ output/session06_slow_press_flicker.mp4            闪烁分析视频
 只处理某个 bag：
 
 ```bash
+/usr/bin/python3 bag_vis.py data/test1.bag
 /usr/bin/python3 bag_vis.py --bags data/test1.bag
+```
+
+多个 bag 并行处理（每个 bag 一个线程，带独立进度条）：
+
+```bash
+# -j 0 为自动（按 bag 数量和 CPU 核数，最多 8 个）
+/usr/bin/python3 bag_vis.py /path/to/bags -j 4 --out-dir output
+```
+
+递归搜索子目录：
+
+```bash
+/usr/bin/python3 bag_vis.py /path/to/bags --recursive
 ```
 
 先导出某一时刻的预览图（不编码视频）：
@@ -115,8 +136,15 @@ output/session06_slow_press_flicker.mp4            闪烁分析视频
 
 | 参数 | 说明 |
 |---|---|
+| `paths` | 位置参数，可以是 bag 文件、folder 或 glob |
+| `--folder` / `--data-dir` | 存放 `.bag` 的目录，默认 `data` |
+| `--bags` | 显式指定 bag 路径，兼容旧用法 |
+| `--recursive` | folder 模式下递归搜索子目录 |
+| `-j` / `--jobs` | 并行处理的 bag 数量；`0` 为自动 |
+| `--preset` | x264 preset，默认 `veryfast`；要更小文件可用 `medium` |
+| `--encoder` | `libx264`（默认）或 `h264_nvenc`（NVIDIA GPU） |
 | `--fps` | 帧率，默认 30 |
-| `--crf` | x264 质量，默认 20，越小越清晰、文件越大 |
+| `--crf` | 视频质量，默认 20，越小越清晰、文件越大 |
 | `--event-mode` | `auto` / `surface` / `density`，默认自动选择 |
 | `--event-tau` | 事件衰减时间（秒）；不填则自动估计 |
 | `--start` / `--end` | 只渲染 bag 内指定时间段 |
@@ -125,8 +153,12 @@ output/session06_slow_press_flicker.mp4            闪烁分析视频
 ## 实现说明
 
 - 事件消息通过 `read_messages(..., raw=True)` 读取并按二进制直接解析，每个事件 13 字节，避免几亿个 Python 对象导致内存/速度问题。
+- 事件按帧批量拼接，避免每来一条 1 kHz 消息就复制一次缓冲区。
+- 事件表面使用 float32 相对时间戳，并复用中间缓冲区；density 模式只对事件覆盖的 ROI 做直方图统计。
+- 布局中的网格、坐标标签和完整暗色曲线只绘制一次，之后每帧复制静态图层；标签框和游标只混合局部 ROI，不再整幅复制 1080p 画布。
 - 力话题自动识别：
   - `geometry_msgs/WrenchStamped` → `wrench.force.x/y/z` + `wrench.torque.x/y/z`
   - `force_data_process/Force` → `fx/fy/fz` + `tx/ty/tz`
 - 时间轴使用 bag 的 header 时间戳；事件按时间戳逐帧累积，力/扭矩数据在帧时刻线性插值。
-- 视频帧通过管道直接送入 ffmpeg（H.264 / yuv420p / faststart），不生成中间图片序列。
+- 视频帧通过管道直接送入 ffmpeg（H.264 / yuv420p / faststart），不生成中间图片序列；默认 `-preset veryfast`。
+- 多个 bag 通过 `ThreadPoolExecutor` 并行处理，每个 bag 输出独立进度条。

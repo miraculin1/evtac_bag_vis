@@ -14,6 +14,7 @@ Supports the two force message layouts found in the data directory:
 
 Run with the system Python that has ROS Noetic and OpenCV installed:
     /usr/bin/python3 bag_vis.py
+    /usr/bin/python3 bag_vis.py /path/to/bags -j 4
     /usr/bin/python3 bag_vis.py --preview 30
 """
 
@@ -24,7 +25,9 @@ import os
 import struct
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 import numpy as np
@@ -81,8 +84,72 @@ COL_TZ_DIM = (60, 100, 65)
 # ---------------------------------------------------------------------------
 
 
+_LOG_LOCK = threading.Lock()
+
+
 def log(msg):
-    print(msg, flush=True)
+    with _LOG_LOCK:
+        print(msg, flush=True)
+
+
+def format_duration(seconds):
+    seconds = max(0, int(round(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+class ProgressBar:
+    """Thread-safe console progress bar, one instance per bag."""
+
+    def __init__(self, label, total, single_line=False, min_interval=1.0):
+        self.label = label
+        self.total = max(1, int(total))
+        self.single_line = bool(single_line) and sys.stdout.isatty()
+        self.min_interval = 0.2 if self.single_line else min_interval
+        self.n = 0
+        self.start = time.monotonic()
+        self.last = 0.0
+        self.closed = False
+
+    def update(self, n=None, force=False):
+        if self.closed:
+            return
+        if n is None:
+            self.n += 1
+        else:
+            self.n = int(n)
+        now = time.monotonic()
+        if not force and now - self.last < self.min_interval:
+            return
+        self.last = now
+        frac = min(max(self.n / self.total, 0.0), 1.0)
+        width = 28
+        filled = int(round(frac * width))
+        bar = "#" * filled + "-" * (width - filled)
+        elapsed = max(now - self.start, 1e-9)
+        fps = self.n / elapsed
+        eta = (self.total - self.n) / fps if fps > 0 else 0.0
+        msg = (
+            f"{self.label} [{bar}] {frac*100:5.1f}% "
+            f"{self.n}/{self.total} {fps:5.1f} fps ETA {format_duration(eta)}"
+        )
+        with _LOG_LOCK:
+            if self.single_line:
+                print("\r" + msg + "\033[K", end="", flush=True)
+            else:
+                print(msg, flush=True)
+
+    def close(self):
+        if self.closed:
+            return
+        self.update(self.n, force=True)
+        self.closed = True
+        if self.single_line:
+            with _LOG_LOCK:
+                print()
 
 
 def text(img, s, org, scale=0.55, color=COL_TEXT, thickness=1):
@@ -97,9 +164,34 @@ def text_right(img, s, right_x, y, scale=0.55, color=COL_TEXT, thickness=1):
 
 
 def put_box(img, x, y, w, h, color, alpha=0.72):
-    overlay = img.copy()
-    cv2.rectangle(overlay, (x, y), (x + w, y + h), color, -1)
-    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
+    """Blend a filled rectangle, touching only the rectangle ROI."""
+    H, W = img.shape[:2]
+    x0 = max(0, int(x))
+    y0 = max(0, int(y))
+    x1 = min(W, int(x) + int(w))
+    y1 = min(H, int(y) + int(h))
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = img[y0:y1, x0:x1]
+    overlay = roi.copy()
+    cv2.rectangle(overlay, (0, 0), (x1 - x0 - 1, y1 - y0 - 1), color, -1)
+    cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0, roi)
+
+
+def blend_vline(img, x, y0, y1, color, alpha=0.85, thickness=2):
+    """Blend a vertical cursor line, touching only a narrow ROI."""
+    H, W = img.shape[:2]
+    x0 = max(0, int(x) - thickness)
+    x1 = min(W, int(x) + thickness + 1)
+    y0 = max(0, int(y0))
+    y1 = min(H, int(y1))
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = img[y0:y1, x0:x1]
+    overlay = roi.copy()
+    lx = int(x) - x0
+    cv2.line(overlay, (lx, 0), (lx, y1 - y0 - 1), color, thickness)
+    cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0, roi)
 
 
 def nice_step(span, target=5.0):
@@ -173,10 +265,15 @@ def detect_topics(bag):
     return event_topic, info[event_topic].msg_type, force_topic, info[force_topic].msg_type
 
 
-def read_force(bag, topic, msg_type):
+def read_force(bag, topic, msg_type, start_time=None, end_time=None):
     """Return (t, fx, fy, fz, tx, ty, tz) as float64 arrays, sorted and deduped."""
+    kwargs = {}
+    if start_time is not None:
+        kwargs["start_time"] = rospy.Time.from_sec(start_time)
+    if end_time is not None:
+        kwargs["end_time"] = rospy.Time.from_sec(end_time)
     rows = []
-    for _, msg, rec in bag.read_messages(topics=[topic]):
+    for _, msg, rec in bag.read_messages(topics=[topic], **kwargs):
         try:
             if msg_type == "geometry_msgs/WrenchStamped":
                 f = msg.wrench.force
@@ -277,12 +374,23 @@ class EventSurface:
 
     mode = "surface"
 
-    def __init__(self, height, width, tau, fps=30):
+    def __init__(self, height, width, tau, fps=30, t0=0.0):
         self.h = height
         self.w = width
-        self.tau = float(tau)
-        self.last_t = np.full((height, width), -1e18, dtype=np.float64)
+        self.tau = np.float32(tau)
+        self.t0 = float(t0)
+        # Relative timestamps keep the age computation in float32 and avoid
+        # precision loss from large absolute ROS times.
+        self.last_t = np.full((height, width), -1e9, dtype=np.float32)
         self.last_pol = np.zeros((height, width), dtype=np.int8)
+
+        self._age = np.empty((height, width), dtype=np.float32)
+        self._inten = np.empty((height, width), dtype=np.float32)
+        self._pos = np.empty((height, width), dtype=np.float32)
+        self._neg = np.empty((height, width), dtype=np.float32)
+        self._u8pos = np.empty((height, width), dtype=np.uint8)
+        self._u8neg = np.empty((height, width), dtype=np.uint8)
+        self._img = np.zeros((height, width, 3), dtype=np.uint8)
 
     def add(self, x, y, t, pol):
         if len(x) == 0:
@@ -290,29 +398,35 @@ class EventSurface:
         # x/y are uint16; cast once for fast fancy indexing
         xi = x.astype(np.int32, copy=False)
         yi = y.astype(np.int32, copy=False)
-        self.last_t[yi, xi] = t
+        self.last_t[yi, xi] = (t - self.t0).astype(np.float32)
         self.last_pol[yi, xi] = np.where(pol, 1, -1).astype(np.int8, copy=False)
 
     def render(self, t_now, gamma=0.72):
-        age = t_now - self.last_t
-        np.maximum(age, 0.0, out=age)
-        inten = np.exp(-age / self.tau).astype(np.float32)
-        valid = self.last_t > -1e17
-        inten *= valid
+        t_rel = np.float32(t_now - self.t0)
+        np.subtract(t_rel, self.last_t, out=self._age)
+        np.maximum(self._age, 0.0, out=self._age)
+        np.divide(self._age, -self.tau, out=self._age)
+        np.exp(self._age, out=self._inten)
 
+        valid = self.last_t > -1e8
+        self._inten *= valid
         if gamma != 1.0:
-            np.power(inten, gamma, out=inten)
+            np.power(self._inten, gamma, out=self._inten)
 
-        pos = np.where(self.last_pol > 0, inten, 0.0).astype(np.float32)
-        neg = np.where(self.last_pol < 0, inten, 0.0).astype(np.float32)
-        if pos.any():
-            pos = cv2.GaussianBlur(pos, (3, 3), 0)
-        if neg.any():
-            neg = cv2.GaussianBlur(neg, (3, 3), 0)
+        pos_mask = self.last_pol > 0
+        neg_mask = self.last_pol < 0
+        np.multiply(self._inten, pos_mask, out=self._pos)
+        np.multiply(self._inten, neg_mask, out=self._neg)
+        if pos_mask.any():
+            cv2.GaussianBlur(self._pos, (3, 3), 0, dst=self._pos)
+        if neg_mask.any():
+            cv2.GaussianBlur(self._neg, (3, 3), 0, dst=self._neg)
 
-        img = np.zeros((self.h, self.w, 3), dtype=np.uint8)
-        img[..., 2] = np.clip(pos * 255.0, 0, 255).astype(np.uint8)  # red
-        img[..., 0] = np.clip(neg * 255.0, 0, 255).astype(np.uint8)  # blue
+        cv2.convertScaleAbs(self._pos, dst=self._u8pos, alpha=255.0)
+        cv2.convertScaleAbs(self._neg, dst=self._u8neg, alpha=255.0)
+        img = self._img
+        img[..., 2] = self._u8pos  # red
+        img[..., 0] = self._u8neg  # blue
         return img
 
 
@@ -325,42 +439,76 @@ class DensitySurface:
 
     mode = "density"
 
-    def __init__(self, height, width, tau, fps=30):
+    def __init__(self, height, width, tau, fps=30, t0=0.0):
         self.h = height
         self.w = width
         self.tau = float(tau)
+        self.t0 = float(t0)
         self.decay = float(math.exp(-1.0 / max(fps * tau, 1e-6)))
         self.acc_pos = np.zeros((height, width), dtype=np.float32)
         self.acc_neg = np.zeros((height, width), dtype=np.float32)
+        self._ch = (
+            np.empty((height, width), dtype=np.float32),
+            np.empty((height, width), dtype=np.float32),
+        )
+        self._u8 = (
+            np.empty((height, width), dtype=np.uint8),
+            np.empty((height, width), dtype=np.uint8),
+        )
+        self._img = np.zeros((height, width, 3), dtype=np.uint8)
 
     def add(self, x, y, t, pol):
         if len(x) == 0:
             return
-        idx = y.astype(np.int64) * self.w + x.astype(np.int64)
-        n = self.h * self.w
+        xi = x.astype(np.int32, copy=False)
+        yi = y.astype(np.int32, copy=False)
+        xmin, xmax = int(xi.min()), int(xi.max())
+        ymin, ymax = int(yi.min()), int(yi.max())
+        xmin = max(xmin, 0)
+        ymin = max(ymin, 0)
+        if xmax >= self.w or ymax >= self.h:
+            xmax = min(xmax, self.w - 1)
+            ymax = min(ymax, self.h - 1)
+            m = (xi >= xmin) & (xi <= xmax) & (yi >= ymin) & (yi <= ymax)
+            xi, yi, pol = xi[m], yi[m], pol[m]
+            if len(xi) == 0:
+                return
+        if xmin > xmax or ymin > ymax:
+            return
+
+        rw = xmax - xmin + 1
+        rh = ymax - ymin + 1
+        n = rw * rh
+        idx = (yi - ymin).astype(np.int64) * rw + (xi - xmin)
         if pol.any():
-            hist = np.bincount(idx[pol], minlength=n).reshape(self.h, self.w)
-            self.acc_pos += hist.astype(np.float32)
-        neg = ~pol
-        if neg.any():
-            hist = np.bincount(idx[neg], minlength=n).reshape(self.h, self.w)
-            self.acc_neg += hist.astype(np.float32)
+            idx += pol.astype(np.int64) * n
+        hist = np.bincount(idx, minlength=2 * n)
+        self.acc_pos[ymin : ymax + 1, xmin : xmax + 1] += (
+            hist[:n].reshape(rh, rw).astype(np.float32)
+        )
+        self.acc_neg[ymin : ymax + 1, xmin : xmax + 1] += (
+            hist[n:].reshape(rh, rw).astype(np.float32)
+        )
 
     def render(self, t_now, gamma=1.40):
-        channels = []
-        for acc in (self.acc_pos, self.acc_neg):
-            a = np.log1p(acc)
-            mx = float(np.percentile(a, 99.5)) if a.size else 0.0
+        for acc, out, u8 in (
+            (self.acc_pos, self._ch[0], self._u8[0]),
+            (self.acc_neg, self._ch[1], self._u8[1]),
+        ):
+            np.log1p(acc, out=out)
+            # A strided subsample is plenty for a robust normalization scale.
+            mx = float(np.percentile(out[::4, ::4], 99.5)) if out.size else 0.0
             if mx > 1e-9:
-                a /= mx
-            np.clip(a * 0.60, 0.0, 1.0, out=a)
+                np.divide(out, mx, out=out)
+            np.multiply(out, 0.60, out=out)
+            np.clip(out, 0.0, 1.0, out=out)
             if gamma != 1.0:
-                np.power(a, gamma, out=a)
-            channels.append(a)
+                np.power(out, gamma, out=out)
+            cv2.convertScaleAbs(out, dst=u8, alpha=255.0)
 
-        img = np.zeros((self.h, self.w, 3), dtype=np.uint8)
-        img[..., 2] = np.clip(channels[0] * 255.0, 0, 255).astype(np.uint8)
-        img[..., 0] = np.clip(channels[1] * 255.0, 0, 255).astype(np.uint8)
+        img = self._img
+        img[..., 2] = self._u8[0]
+        img[..., 0] = self._u8[1]
 
         # Decay after rendering so this frame's events are fully visible.
         self.acc_pos *= self.decay
@@ -463,6 +611,16 @@ class Renderer:
             "ty": self._torque_points(self.torque_ds_t, f_ty[idx]),
             "tz": self._torque_points(self.torque_ds_t, f_tz[idx]),
         }
+        self._torque_series = (
+            ("tx", COL_TX, COL_TX_DIM),
+            ("ty", COL_TY, COL_TY_DIM),
+            ("tz", COL_TZ, COL_TZ_DIM),
+        )
+
+        # Static parts of the layout are drawn once and copied per frame.
+        self.static = np.empty((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
+        self.canvas = np.empty_like(self.static)
+        self._build_static()
 
     # ------------------------------------------------------------------
     # coordinate maps
@@ -507,15 +665,18 @@ class Renderer:
     # drawing helpers
     # ------------------------------------------------------------------
 
+    def _draw_event_static(self, canvas):
+        x, y, w, h = self.ex, self.ey, self.ew, self.eh
+        cv2.rectangle(canvas, (x - 1, y - 1), (x + w, y + h), COL_GRID, 1)
+        text(canvas, "EVENT CAMERA  |  90 deg CW", (x, 32), 0.58, COL_TEXT, 1)
+
     def _draw_event_panel(self, canvas, event_img, t):
         x, y, w, h = self.ex, self.ey, self.ew, self.eh
         rot = cv2.rotate(event_img, cv2.ROTATE_90_CLOCKWISE)
         if rot.shape[1] != w or rot.shape[0] != h:
             rot = cv2.resize(rot, (w, h), interpolation=cv2.INTER_LINEAR)
         canvas[y : y + h, x : x + w] = rot
-        cv2.rectangle(canvas, (x - 1, y - 1), (x + w, y + h), COL_GRID, 1)
 
-        text(canvas, "EVENT CAMERA  |  90 deg CW", (x, 32), 0.58, COL_TEXT, 1)
         text(canvas, "red = ON   blue = OFF", (x, y + h - 16), 0.48, COL_MUTED, 1)
 
         label = f"t = {t:6.2f} s / {self.duration:6.2f} s"
@@ -630,7 +791,7 @@ class Renderer:
         text(canvas, "FX+", (cx + 8, cy + r - 8), 0.40, COL_MUTED, 1)
         text(canvas, "FY-", (cx + r - 42, cy - 8), 0.40, COL_MUTED, 1)
 
-    def _draw_torque(self, canvas, t, tx, ty, tz):
+    def _draw_torque_static(self, canvas):
         x0, y0, x1, y1 = self.tx0, self.ty0, self.tx1, self.ty1
         cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_PANEL, -1)
         cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_GRID, 1)
@@ -674,51 +835,56 @@ class Renderer:
             1,
         )
 
-        j = int(np.searchsorted(self.torque_ds_t, t, side="right"))
-        series = (
-            ("tx", tx, COL_TX, COL_TX_DIM),
-            ("ty", ty, COL_TY, COL_TY_DIM),
-            ("tz", tz, COL_TZ, COL_TZ_DIM),
-        )
-        for name, val, col, dim in series:
+        # full dim curves, drawn once
+        for name, _col, dim in self._torque_series:
             pts = self.torque_pts[name]
             if len(pts) > 1:
                 cv2.polylines(canvas, [pts], False, dim, 1, cv2.LINE_AA)
+
+        # legend box and color keys, drawn once
+        lx = x1 - 320
+        ly = y0 + 14
+        put_box(canvas, lx - 8, ly - 6, 320, 92, (0, 0, 0), 0.62)
+        for i, (_name, col, _dim) in enumerate(self._torque_series):
+            yy = ly + 20 + i * 24
+            cv2.line(canvas, (lx, yy - 4), (lx + 22, yy - 4), col, 3, cv2.LINE_AA)
+        text(canvas, "Nm", (lx + 30, ly + 86), 0.40, COL_MUTED, 1)
+
+    def _draw_torque(self, canvas, t, tx, ty, tz):
+        x0, y0, x1, y1 = self.tx0, self.ty0, self.tx1, self.ty1
+        vals = {"tx": tx, "ty": ty, "tz": tz}
+
+        j = int(np.searchsorted(self.torque_ds_t, t, side="right"))
+        for name, col, _dim in self._torque_series:
+            pts = self.torque_pts[name]
             if j > 1:
                 cv2.polylines(canvas, [pts[:j]], False, col, 2, cv2.LINE_AA)
 
         cxp = int(round(x0 + (t / self.duration) * (x1 - x0)))
-        overlay = canvas.copy()
-        cv2.line(overlay, (cxp, y0 + 1), (cxp, y1 - 1), COL_YELLOW, 2)
-        cv2.addWeighted(overlay, 0.85, canvas, 0.15, 0, canvas)
-        for name, val, col, _dim in series:
-            _, py = self._torque_xy(np.array([t]), np.array([val]))
-            cyp = int(py[0])
-            cv2.circle(canvas, (cxp, cyp), 4, col, -1, cv2.LINE_AA)
+        blend_vline(canvas, cxp, y0 + 1, y1 - 1, COL_YELLOW, 0.85, 2)
+        for name, col, _dim in self._torque_series:
+            _, py = self._torque_xy(np.array([t]), np.array([vals[name]]))
+            cv2.circle(canvas, (cxp, int(py[0])), 4, col, -1, cv2.LINE_AA)
 
-        # legend + current values
+        # current values in the static legend box
         lx = x1 - 320
         ly = y0 + 14
-        put_box(canvas, lx - 8, ly - 6, 320, 92, (0, 0, 0), 0.62)
-        for i, (name, val, col, _dim) in enumerate(series):
+        for i, (name, col, _dim) in enumerate(self._torque_series):
             yy = ly + 20 + i * 24
-            cv2.line(canvas, (lx, yy - 4), (lx + 22, yy - 4), col, 3, cv2.LINE_AA)
             text(
                 canvas,
-                f"{name}  {format_n(val)}",
+                f"{name}  {format_n(vals[name])}",
                 (lx + 30, yy),
                 0.50,
                 col,
                 1,
             )
-        text(canvas, "Nm", (lx + 30, ly + 86), 0.40, COL_MUTED, 1)
 
-    def _draw_fz(self, canvas, t, fz):
+    def _draw_fz_static(self, canvas):
         x0, y0, x1, y1 = self.gx0, self.gy0, self.gx1, self.gy1
         cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_PANEL, -1)
         cv2.rectangle(canvas, (x0, y0), (x1, y1), COL_GRID, 1)
         text(canvas, "FZ / TIME (N)", (x0, y0 - 14), 0.55, COL_TEXT, 1)
-        text_right(canvas, f"t = {t:.2f} s", x1, y0 - 14, 0.50, COL_MUTED, 1)
 
         # horizontal grid / y labels
         v = self.fz_min
@@ -739,9 +905,15 @@ class Renderer:
             text(canvas, f"{tt:g}", (px - 12, y1 + 22), 0.42, COL_MUTED, 1)
             tt += tstep
 
-        # full fz curve, dim
+        # full fz curve, dim, drawn once
         if len(self.fz_full_pts) > 1:
-            cv2.polylines(canvas, [self.fz_full_pts], False, (92, 104, 88), 1, cv2.LINE_AA)
+            cv2.polylines(
+                canvas, [self.fz_full_pts], False, (92, 104, 88), 1, cv2.LINE_AA
+            )
+
+    def _draw_fz(self, canvas, t, fz):
+        x0, y0, x1, y1 = self.gx0, self.gy0, self.gx1, self.gy1
+        text_right(canvas, f"t = {t:.2f} s", x1, y0 - 14, 0.50, COL_MUTED, 1)
 
         # played part, bright
         j = int(np.searchsorted(self.fz_ds_t, t, side="right"))
@@ -754,9 +926,7 @@ class Renderer:
         cxp = float(self._fz_xy(np.array([t]), np.array([fz]))[0][0])
         cyp = float(self._fz_xy(np.array([t]), np.array([fz]))[1][0])
         cxp_i, cyp_i = int(round(cxp)), int(round(cyp))
-        overlay = canvas.copy()
-        cv2.line(overlay, (cxp_i, y0 + 1), (cxp_i, y1 - 1), COL_YELLOW, 2)
-        cv2.addWeighted(overlay, 0.85, canvas, 0.15, 0, canvas)
+        blend_vline(canvas, cxp_i, y0 + 1, y1 - 1, COL_YELLOW, 0.85, 2)
         cv2.circle(canvas, (cxp_i, cyp_i), 5, COL_YELLOW, -1, cv2.LINE_AA)
 
         # value badge
@@ -772,18 +942,14 @@ class Renderer:
 
     # ------------------------------------------------------------------
 
-    def render(self, t, event_img, fx, fy, fz, tx, ty, tz):
-        canvas = np.empty((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
-        canvas[:] = COL_BG
-
-        self._draw_event_panel(canvas, event_img, t)
-        self._draw_force_hud(canvas, t, fx, fy)
-        self._draw_torque(canvas, t, tx, ty, tz)
-        self._draw_fz(canvas, t, fz)
-
-        text(canvas, self.bag_name, (848, 40), 0.62, COL_TEXT, 1)
+    def _build_static(self):
+        self.static[:] = COL_BG
+        self._draw_event_static(self.static)
+        self._draw_torque_static(self.static)
+        self._draw_fz_static(self.static)
+        text(self.static, self.bag_name, (848, 40), 0.62, COL_TEXT, 1)
         text_right(
-            canvas,
+            self.static,
             "EVENT + FORCE + TORQUE VISUALIZATION",
             CANVAS_W - 24,
             40,
@@ -791,6 +957,15 @@ class Renderer:
             COL_MUTED,
             1,
         )
+
+    def render(self, t, event_img, fx, fy, fz, tx, ty, tz):
+        canvas = self.canvas
+        np.copyto(canvas, self.static)
+
+        self._draw_event_panel(canvas, event_img, t)
+        self._draw_force_hud(canvas, t, fx, fy)
+        self._draw_torque(canvas, t, tx, ty, tz)
+        self._draw_fz(canvas, t, fz)
         return canvas
 
 
@@ -810,7 +985,7 @@ def force_at(t, f_t, f_fx, f_fy, f_fz, f_tx, f_ty, f_tz):
     )
 
 
-def make_ffmpeg(out_path, fps, crf):
+def make_ffmpeg(out_path, fps, crf, preset="veryfast", encoder="libx264"):
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     cmd = [
         "ffmpeg",
@@ -830,18 +1005,28 @@ def make_ffmpeg(out_path, fps, crf):
         "-i",
         "-",
         "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-crf",
-        str(crf),
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        out_path,
     ]
+    if encoder == "h264_nvenc":
+        nv_preset = {
+            "ultrafast": "fast",
+            "veryfast": "fast",
+            "fast": "fast",
+            "medium": "medium",
+            "slow": "slow",
+        }.get(preset, "medium")
+        cmd += [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            nv_preset,
+            "-cq",
+            str(crf),
+            "-b:v",
+            "0",
+        ]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf)]
+    cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
 
@@ -850,19 +1035,22 @@ def process_bag(bag_path, args):
     try:
         event_topic, event_type, force_topic, force_type = detect_topics(bag)
         stem = os.path.splitext(os.path.basename(bag_path))[0]
-        log(f"\n[{stem}]")
-        log(f"  events : {event_topic} ({event_type})")
-        log(f"  force  : {force_topic} ({force_type})")
+        tag = f"[{stem}]"
+        log(f"{tag} events : {event_topic} ({event_type})")
+        log(f"{tag} force  : {force_topic} ({force_type})")
 
         t0 = bag.get_start_time()
         t1 = bag.get_end_time()
-        duration = t1 - t0
         if args.start is not None:
             t0 = max(t0, bag.get_start_time() + args.start)
         if args.end is not None:
             t1 = min(t1, bag.get_start_time() + args.end)
-        duration = max(t1 - t0, 1e-6)
+        if t1 <= t0:
+            raise RuntimeError("empty time window; check --start/--end")
+        duration = t1 - t0
 
+        # Read a little extra force data around the window so interpolation at
+        # the first/last frame has samples on both sides.
         (
             f_t,
             f_fx,
@@ -871,7 +1059,13 @@ def process_bag(bag_path, args):
             f_tx,
             f_ty,
             f_tz,
-        ) = read_force(bag, force_topic, force_type)
+        ) = read_force(
+            bag,
+            force_topic,
+            force_type,
+            start_time=max(bag.get_start_time(), t0 - 1.0),
+            end_time=min(bag.get_end_time(), t1 + 1.0),
+        )
         # The sensor is mounted on the contact side and reports the reaction
         # force/torque. Flip the signs so the plots show contact values.
         f_fx = -f_fx
@@ -881,12 +1075,12 @@ def process_bag(bag_path, args):
         f_ty = -f_ty
         f_tz = -f_tz
         log(
-            "  force  : (sign inverted) "
+            f"{tag} force  : (sign inverted) "
             f"{len(f_t)} samples, fx/fy=[{f_fx.min():.2f}, {f_fx.max():.2f}]/"
             f"[{f_fy.min():.2f}, {f_fy.max():.2f}], fz=[{f_fz.min():.2f}, {f_fz.max():.2f}]"
         )
         log(
-            "  torque : "
+            f"{tag} torque : "
             f"tx/ty=[{f_tx.min():.3f}, {f_tx.max():.3f}]/"
             f"[{f_ty.min():.3f}, {f_ty.max():.3f}], "
             f"tz=[{f_tz.min():.3f}, {f_tz.max():.3f}] Nm"
@@ -919,7 +1113,7 @@ def process_bag(bag_path, args):
         else:
             tau = float(np.clip(0.35 / max(rate_per_px, 1e-6), 0.035, 0.18))
         log(
-            f"  events : ~{rate/1e6:.2f} M ev/s, "
+            f"{tag} events : ~{rate/1e6:.2f} M ev/s, "
             f"mode = {mode}, display tau = {tau*1000:.1f} ms"
         )
 
@@ -934,12 +1128,12 @@ def process_bag(bag_path, args):
             raise RuntimeError("event stream is empty")
         event_h, event_w = first[4], first[5]
         if (event_h, event_w) != (480, 640):
-            log(f"  warning: event resolution is {event_w}x{event_h}, not 640x480")
+            log(f"{tag} warning: event resolution is {event_w}x{event_h}, not 640x480")
 
         surface = (
-            DensitySurface(event_h, event_w, tau, args.fps)
+            DensitySurface(event_h, event_w, tau, args.fps, t0=t0)
             if mode == "density"
-            else EventSurface(event_h, event_w, tau, args.fps)
+            else EventSurface(event_h, event_w, tau, args.fps, t0=t0)
         )
         renderer = Renderer(
             stem,
@@ -962,16 +1156,32 @@ def process_bag(bag_path, args):
 
         n_frames = max(1, int(math.ceil(duration * args.fps)))
         out_path = os.path.join(args.out_dir, stem + ".mp4")
-        log(f"  video  : {out_path} ({n_frames} frames @ {args.fps} fps)")
-        proc = make_ffmpeg(out_path, args.fps, args.crf)
+        log(f"{tag} video  : {out_path} ({n_frames} frames @ {args.fps} fps)")
+        proc = make_ffmpeg(
+            out_path, args.fps, args.crf, args.preset, args.encoder
+        )
 
         t_start = time.time()
         frame_idx = 0
         total_events = 0
-        px = np.empty(0, np.uint16)
-        py = np.empty(0, np.uint16)
-        pt = np.empty(0, np.float64)
-        pp = np.empty(0, bool)
+        pend_x, pend_y, pend_t, pend_p = [], [], [], []
+        bar = ProgressBar(tag, n_frames, single_line=(getattr(args, "jobs", 1) == 1))
+
+        def flush_pending():
+            nonlocal pend_x, pend_y, pend_t, pend_p
+            if not pend_x:
+                return None
+            if len(pend_x) == 1:
+                arrs = (pend_x[0], pend_y[0], pend_t[0], pend_p[0])
+            else:
+                arrs = (
+                    np.concatenate(pend_x),
+                    np.concatenate(pend_y),
+                    np.concatenate(pend_t),
+                    np.concatenate(pend_p),
+                )
+            pend_x, pend_y, pend_t, pend_p = [], [], [], []
+            return arrs
 
         def emit_frame(idx):
             nonlocal frame_idx
@@ -984,17 +1194,16 @@ def process_bag(bag_path, args):
             canvas = renderer.render(t_rel, ev_img, fx, fy, fz, tx, ty, tz)
             proc.stdin.write(canvas.tobytes())
             frame_idx = idx + 1
-            if frame_idx % 150 == 0 or frame_idx == n_frames:
-                elapsed = time.time() - t_start
-                log(
-                    f"    frame {frame_idx}/{n_frames} "
-                    f"({100.0*frame_idx/n_frames:5.1f}%) {elapsed:6.1f}s"
-                )
+            bar.update(frame_idx)
 
         try:
             read_start = rospy.Time.from_sec(max(bag.get_start_time(), t0 - 0.05))
+            read_end = rospy.Time.from_sec(min(bag.get_end_time(), t1 + 0.05))
             for item in bag.read_messages(
-                topics=[event_topic], raw=True, start_time=read_start
+                topics=[event_topic],
+                raw=True,
+                start_time=read_start,
+                end_time=read_end,
             ):
                 parsed = parse_event_raw(get_raw_event(item))
                 if parsed is None:
@@ -1002,48 +1211,67 @@ def process_bag(bag_path, args):
                 ex, ey, et, ep, eh, ew = parsed
                 if (eh, ew) != (event_h, event_w):
                     raise RuntimeError("event resolution changed within the bag")
-                if len(et) and et[-1] < t0:
+                if len(et) == 0:
                     continue
-                if len(et) and et[0] < t0:
-                    keep = et >= t0
+                keep = (et >= t0) & (et <= t1)
+                if not keep.all():
                     ex, ey, et, ep = ex[keep], ey[keep], et[keep], ep[keep]
-                total_events += len(ex)
+                if len(et) == 0:
+                    continue
 
-                if len(px):
-                    px = np.concatenate([px, ex])
-                    py = np.concatenate([py, ey])
-                    pt = np.concatenate([pt, et])
-                    pp = np.concatenate([pp, ep])
-                else:
-                    px, py, pt, pp = ex, ey, et, ep
+                total_events += len(et)
+                pend_x.append(ex)
+                pend_y.append(ey)
+                pend_t.append(et)
+                pend_p.append(ep)
+                last_event_t = float(et[-1])
 
-                last_event_t = float(et[-1]) if len(et) else t0
+                if frame_idx >= n_frames:
+                    break
+                if last_event_t < t0 + (frame_idx + 1) / args.fps:
+                    continue
+
+                arrs = flush_pending()
+                if arrs is None:
+                    continue
+                px, py, pt, pp = arrs
                 while frame_idx < n_frames:
                     tf = t0 + (frame_idx + 1) / args.fps
                     if tf > last_event_t:
                         break
                     n = int(np.searchsorted(pt, tf, side="right"))
-                    if n == 0:
-                        break
-                    surface.add(px[:n], py[:n], pt[:n], pp[:n])
+                    if n:
+                        surface.add(px[:n], py[:n], pt[:n], pp[:n])
+                        px, py, pt, pp = px[n:], py[n:], pt[n:], pp[n:]
                     emit_frame(frame_idx)
-                    px, py, pt, pp = px[n:], py[n:], pt[n:], pp[n:]
                     if frame_idx >= n_frames:
                         break
-                if frame_idx >= n_frames:
-                    break
+                if len(px):
+                    pend_x, pend_y, pend_t, pend_p = [px], [py], [pt], [pp]
 
-            while frame_idx < n_frames:
-                emit_frame(frame_idx)
+            if frame_idx < n_frames:
+                arrs = flush_pending()
+                if arrs is not None:
+                    px, py, pt, pp = arrs
+                    final_t = min(t0 + n_frames / args.fps, t1)
+                    keep = pt <= final_t
+                    if keep.any():
+                        surface.add(px[keep], py[keep], pt[keep], pp[keep])
+                while frame_idx < n_frames:
+                    emit_frame(frame_idx)
         finally:
-            proc.stdin.close()
+            try:
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
             rc = proc.wait()
+            bar.close()
         if rc != 0:
             raise RuntimeError(f"ffmpeg failed with exit code {rc}")
 
         elapsed = time.time() - t_start
         log(
-            f"  done   : {n_frames} frames, {total_events/1e6:.1f}M events, "
+            f"{tag} done   : {n_frames} frames, {total_events/1e6:.1f}M events, "
             f"{elapsed:.1f}s, {os.path.getsize(out_path)/1e6:.1f} MB"
         )
         return out_path
@@ -1092,7 +1320,7 @@ def render_preview(bag, event_topic, surface, renderer, args, stem, t0, t1):
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     cv2.imwrite(out, canvas)
     log(
-        f"  preview: {out} "
+        f"[{stem}] preview: {out} "
         f"(fx={fx:+.3f}, fy={fy:+.3f}, fz={fz:+.3f}, "
         f"tx={tx:+.3f}, ty={ty:+.3f}, tz={tz:+.3f})"
     )
@@ -1102,18 +1330,89 @@ def render_preview(bag, event_topic, surface, renderer, args, stem, t0, t1):
 # ---------------------------------------------------------------------------
 
 
+def collect_bags(args):
+    """Resolve positional paths, --bags, or --data-dir into a bag file list."""
+    entries = []
+    if args.paths:
+        entries.extend(args.paths)
+    elif args.bags:
+        entries.extend(args.bags)
+    else:
+        entries.append(args.data_dir)
+
+    bags = []
+    seen = set()
+    for entry in entries:
+        entry = os.path.expanduser(entry)
+        if os.path.isdir(entry):
+            pattern = (
+                os.path.join(entry, "**", "*.bag")
+                if args.recursive
+                else os.path.join(entry, "*.bag")
+            )
+            found = sorted(glob.glob(pattern, recursive=args.recursive))
+        elif os.path.isfile(entry):
+            found = [entry]
+        else:
+            matches = sorted(glob.glob(entry))
+            found = [m for m in matches if os.path.isfile(m)]
+            if not found:
+                log(f"error: not found: {entry}")
+                continue
+        if not found:
+            log(f"warning: no .bag files in {entry}")
+        for path in found:
+            absolute = os.path.abspath(path)
+            if absolute not in seen:
+                seen.add(absolute)
+                bags.append(path)
+    return bags
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Render event-camera + force videos from ROS bags."
     )
     ap.add_argument(
-        "--data-dir", default="data", help="directory containing .bag files (default: data)"
+        "paths",
+        nargs="*",
+        help="bag files or folders; overrides --bags/--data-dir",
+    )
+    ap.add_argument(
+        "--data-dir",
+        "--folder",
+        dest="data_dir",
+        default="data",
+        help="directory containing .bag files (default: data)",
     )
     ap.add_argument(
         "--out-dir", default="output", help="output directory (default: output)"
     )
     ap.add_argument(
         "--bags", nargs="*", default=None, help="explicit bag path(s); overrides --data-dir"
+    )
+    ap.add_argument(
+        "--recursive",
+        action="store_true",
+        help="search subdirectories when a folder is given",
+    )
+    ap.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=0,
+        help="number of bags to process in parallel (0 = auto, default)",
+    )
+    ap.add_argument(
+        "--preset",
+        default="veryfast",
+        help="x264 preset (default: veryfast; try medium for smaller files)",
+    )
+    ap.add_argument(
+        "--encoder",
+        choices=("libx264", "h264_nvenc"),
+        default="libx264",
+        help="video encoder (default: libx264; h264_nvenc uses the GPU)",
     )
     ap.add_argument("--fps", type=int, default=FPS_DEFAULT)
     ap.add_argument("--crf", type=int, default=20)
@@ -1140,25 +1439,42 @@ def main():
     ap.add_argument("--end", type=float, default=None, help="end offset in seconds")
     args = ap.parse_args()
 
-    if args.bags:
-        bags = list(args.bags)
-    else:
-        bags = sorted(glob.glob(os.path.join(args.data_dir, "*.bag")))
+    bags = collect_bags(args)
     if not bags:
-        log(f"error: no .bag files found in {args.data_dir!r}")
+        log("error: no .bag files found")
         return 2
 
+    auto_jobs = min(len(bags), os.cpu_count() or 1, 8)
+    jobs = args.jobs if args.jobs > 0 else auto_jobs
+    jobs = max(1, min(jobs, len(bags), os.cpu_count() or 1))
+    args.jobs = jobs
+    if jobs > 1:
+        # Avoid oversubscribing OpenCV's internal thread pool when several
+        # bags are rendered at the same time.
+        cv2.setNumThreads(max(1, (os.cpu_count() or 1) // jobs))
+
+    log(f"processing {len(bags)} bag(s) with {jobs} worker(s)")
     ok = True
-    for bag_path in bags:
-        if not os.path.isfile(bag_path):
-            log(f"error: not a file: {bag_path}")
-            ok = False
-            continue
-        try:
-            process_bag(bag_path, args)
-        except Exception as exc:
-            log(f"error while processing {bag_path}: {exc}")
-            ok = False
+    if jobs == 1:
+        for bag_path in bags:
+            try:
+                process_bag(bag_path, args)
+            except Exception as exc:
+                log(f"error while processing {bag_path}: {exc}")
+                ok = False
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = {
+                executor.submit(process_bag, bag_path, args): bag_path
+                for bag_path in bags
+            }
+            for future in as_completed(futures):
+                bag_path = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    log(f"error while processing {bag_path}: {exc}")
+                    ok = False
     return 0 if ok else 1
 
 
