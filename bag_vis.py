@@ -20,6 +20,7 @@ Run with the system Python that has ROS Noetic and OpenCV installed:
 
 import argparse
 import glob
+import json
 import math
 import os
 import struct
@@ -311,6 +312,39 @@ def read_force(bag, topic, msg_type, start_time=None, end_time=None):
         raise RuntimeError(f"not enough force samples on {topic}")
     return (arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3],
             arr[:, 4], arr[:, 5], arr[:, 6])
+
+
+def load_sync_calibration(path):
+    """Load a sync_calibrate.py JSON file, or return None."""
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        raise RuntimeError(f"cannot read sync calibration {path}: {exc}") from exc
+    if not isinstance(data, dict) or "bags" not in data:
+        raise RuntimeError(f"invalid sync calibration file: {path}")
+    return data
+
+
+def resolve_force_shift(stem, args, calibration):
+    """Return (shift_seconds, source_label) for this bag."""
+    if getattr(args, "no_sync", False):
+        return 0.0, "disabled"
+    manual = getattr(args, "force_shift", None)
+    if manual is not None:
+        return float(manual), "manual"
+    if calibration is None:
+        return 0.0, "none"
+
+    entry = calibration.get("bags", {}).get(stem)
+    if entry:
+        shift_ms = entry.get("force_time_shift_ms")
+        if shift_ms is not None:
+            return float(shift_ms) / 1000.0, "bag"
+    global_shift = calibration.get("global", {}).get("force_time_shift_ms", 0.0)
+    return float(global_shift) / 1000.0, "global"
 
 
 def parse_event_raw(raw):
@@ -1067,8 +1101,17 @@ def process_bag(bag_path, args):
             raise RuntimeError("empty time window; check --start/--end")
         duration = t1 - t0
 
-        # Read a little extra force data around the window so interpolation at
-        # the first/last frame has samples on both sides.
+        shift_s, shift_source = resolve_force_shift(
+            stem, args, getattr(args, "sync_calib_data", None)
+        )
+        if shift_source != "none":
+            log(
+                f"{tag} sync   : force shift {shift_s*1000:+.1f} ms "
+                f"({shift_source})"
+            )
+
+        # Read enough force data for interpolation after the time shift.
+        force_margin = max(1.0, abs(shift_s) + 0.5)
         (
             f_t,
             f_fx,
@@ -1081,8 +1124,8 @@ def process_bag(bag_path, args):
             bag,
             force_topic,
             force_type,
-            start_time=max(bag.get_start_time(), t0 - 1.0),
-            end_time=min(bag.get_end_time(), t1 + 1.0),
+            start_time=max(bag.get_start_time(), t0 - force_margin),
+            end_time=min(bag.get_end_time(), t1 + force_margin),
         )
         # The sensor is mounted on the contact side and reports the reaction
         # force/torque. Flip the signs so the plots show contact values.
@@ -1104,8 +1147,11 @@ def process_bag(bag_path, args):
             f"tz=[{f_tz.min():.3f}, {f_tz.max():.3f}] Nm"
         )
 
-        # Restrict force samples to the rendered time window (important for --start/--end).
-        sel = (f_t >= t0 - 1e-6) & (f_t <= t1 + 1e-6)
+        # Restrict force samples to the shifted render window so the shifted
+        # force curve still spans exactly [0, duration].
+        sel_lo = t0 - shift_s - 1e-6
+        sel_hi = t1 - shift_s + 1e-6
+        sel = (f_t >= sel_lo) & (f_t <= sel_hi)
         if sel.sum() < 2:
             sel = np.ones(len(f_t), dtype=bool)
         f_t = f_t[sel]
@@ -1115,7 +1161,7 @@ def process_bag(bag_path, args):
         f_tx = f_tx[sel]
         f_ty = f_ty[sel]
         f_tz = f_tz[sel]
-        f_t_rel = f_t - t0
+        f_t_rel = f_t - t0 + shift_s
 
         rate = estimate_event_rate(bag, event_topic, t0, window=min(2.0, duration))
         rate_per_px = rate / (480.0 * 640.0)
@@ -1455,6 +1501,24 @@ def main():
         "old = fx+ down / fy- right",
     )
     ap.add_argument(
+        "--sync-calib",
+        default=None,
+        metavar="JSON",
+        help="event/force sync calibration JSON from sync_calibrate.py",
+    )
+    ap.add_argument(
+        "--force-shift",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="manual force time shift; overrides --sync-calib",
+    )
+    ap.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="disable event/force time alignment",
+    )
+    ap.add_argument(
         "--preview",
         type=float,
         default=None,
@@ -1464,6 +1528,11 @@ def main():
     ap.add_argument("--start", type=float, default=None, help="start offset in seconds")
     ap.add_argument("--end", type=float, default=None, help="end offset in seconds")
     args = ap.parse_args()
+
+    args.sync_calib_data = None
+    if args.sync_calib:
+        args.sync_calib_data = load_sync_calibration(args.sync_calib)
+        log(f"sync calibration: {args.sync_calib}")
 
     bags = collect_bags(args)
     if not bags:

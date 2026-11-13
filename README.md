@@ -132,6 +132,44 @@ output/session06_slow_press_flicker.mp4            闪烁分析视频
 /usr/bin/python3 bag_vis.py --start 28 --end 32 --out-dir output/clips
 ```
 
+## 事件-力时间软同步
+
+`tac_bag/` 中的事件流相对力变化存在约 0.4 s 的延迟。`sync_calibrate.py` 用
+“事件计数 vs 力变化率”的窗口化互相关估计每个 bag 的延迟，并写出 JSON：
+
+```bash
+/usr/bin/python3 sync_calibrate.py tac_bag -j 4 \
+  -o calibration/event_force_sync.json
+```
+
+当前 `tac_bag/` 的校准结果：
+
+- `cl_train03_fast_press`: **+376 ms**
+- `cl_val02_mixed_slide`: **+493 ms**
+- 全局中位数：**+413 ms**（9/11 个 bag 质量合格）
+- `cl_train01_null`、`cl_train02_slow_press` 质量不足，自动回退到全局值
+
+`bag_vis.py` 通过 `--sync-calib` 消费校准文件：
+
+```bash
+/usr/bin/python3 bag_vis.py tac_bag -j 4 \
+  --sync-calib calibration/event_force_sync.json \
+  --out-dir out_bright
+```
+
+符号约定：正值表示**事件滞后力**，`bag_vis.py` 会把力时间轴向前移动该值。
+力曲线、fz/torque 曲线和 fx-fy HUD 会一起对齐；不会修改原始 bag。
+
+也可以手动覆盖或禁用：
+
+```bash
+# 手动指定 400 ms
+/usr/bin/python3 bag_vis.py tac_bag/cl_train03_fast_press.bag --force-shift 0.4
+
+# 不做时间对齐
+/usr/bin/python3 bag_vis.py tac_bag/cl_train03_fast_press.bag --no-sync
+```
+
 ## 常用参数
 
 | 参数 | 说明 |
@@ -148,6 +186,9 @@ output/session06_slow_press_flicker.mp4            闪烁分析视频
 | `--event-mode` | `auto` / `surface` / `density`，默认自动选择 |
 | `--event-tau` | 事件衰减时间（秒）；不填则自动估计 |
 | `--force-orientation` | `new`（默认，`fx-` 向右、`fy-` 向下）或 `old`（`fx+` 向下、`fy-` 向右） |
+| `--sync-calib JSON` | 使用 `sync_calibrate.py` 生成的校准文件 |
+| `--force-shift SECONDS` | 手动力时间偏移，优先于校准文件 |
+| `--no-sync` | 禁用事件/力时间对齐 |
 | `--start` / `--end` | 只渲染 bag 内指定时间段 |
 | `--preview SECONDS` | 只输出该时刻的 PNG |
 
@@ -163,3 +204,5 @@ output/session06_slow_press_flicker.mp4            闪烁分析视频
 - 时间轴使用 bag 的 header 时间戳；事件按时间戳逐帧累积，力/扭矩数据在帧时刻线性插值。
 - 视频帧通过管道直接送入 ffmpeg（H.264 / yuv420p / faststart），不生成中间图片序列；默认 `-preset veryfast`。
 - 多个 bag 通过 `ThreadPoolExecutor` 并行处理，每个 bag 输出独立进度条。
+- `sync_calibrate.py` 使用 10 ms 分箱、50 ms 平滑、5 s 窗口 / 2.5 s 步长的互相关，取窗口延迟中位数和 MAD；质量不足时使用全局中位数。
+- `bag_vis.py` 在渲染时把力时间轴平移校准值，不修改原始 bag；力曲线和事件时间轴因此对齐。
